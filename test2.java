@@ -1,214 +1,119 @@
-Parfait 👍
-Voici la version clean et adaptée à ton projet avec Lombok + Java 8, prête à coller.
+@Async("batchExecutor")
+@Transactional
+public void runAsyncForceUpdateAll(String runId) {
 
-Je te donne :
-	1.	SQL
-	2.	Entity BatchRun (Lombok, Java 8)
-	3.	Repository
-	4.	Bonnes pratiques d’utilisation dans ton batch
-
-⸻
-
-1️⃣ SQL – table batch_run (PostgreSQL)
-
-CREATE TABLE IF NOT EXISTS batch_run (
-  id              VARCHAR(36) PRIMARY KEY,
-  type            VARCHAR(50) NOT NULL,
-  status          VARCHAR(20) NOT NULL, -- QUEUED / RUNNING / DONE / FAILED / STOPPED
-
-  created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at      TIMESTAMP NOT NULL DEFAULT NOW(),
-
-  total_count     BIGINT NOT NULL DEFAULT 0,
-  success_count   BIGINT NOT NULL DEFAULT 0,
-  failed_count    BIGINT NOT NULL DEFAULT 0,
-  skipped_count   BIGINT NOT NULL DEFAULT 0,
-
-  last_error      TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_batch_run_status ON batch_run(status);
-
-
-⸻
-
-2️⃣ Entity JPA BatchRun (Lombok + Java 8)
-
-import lombok.*;
-import javax.persistence.*;
-import java.time.Instant;
-
-@Entity
-@Table(name = "batch_run")
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class BatchRun {
-
-  @Id
-  @Column(length = 36, nullable = false)
-  private String id;
-
-  @Column(nullable = false, length = 50)
-  private String type;
-
-  @Column(nullable = false, length = 20)
-  private String status;
-
-  @Column(name = "created_at", nullable = false)
-  private Instant createdAt;
-
-  @Column(name = "updated_at", nullable = false)
-  private Instant updatedAt;
-
-  @Column(name = "total_count", nullable = false)
-  private long totalCount;
-
-  @Column(name = "success_count", nullable = false)
-  private long successCount;
-
-  @Column(name = "failed_count", nullable = false)
-  private long failedCount;
-
-  @Column(name = "skipped_count", nullable = false)
-  private long skippedCount;
-
-  @Lob
-  @Column(name = "last_error")
-  private String lastError;
-
-  // Factory helper
-  public static BatchRun newRun(String id, String type) {
-    Instant now = Instant.now();
-    return BatchRun.builder()
-        .id(id)
-        .type(type)
-        .status("QUEUED")
-        .createdAt(now)
-        .updatedAt(now)
-        .build();
+  BatchRun run = batchRunRepository.findById(runId).orElse(null);
+  if (run == null) {
+    log.error("BatchRun not found for runId={}", runId);
+    return;
   }
 
-  public void markRunning() {
-    this.status = "RUNNING";
-    this.updatedAt = Instant.now();
-  }
+  run.markRunning();
+  batchRunRepository.save(run);
 
-  public void markDone() {
-    this.status = "DONE";
-    this.updatedAt = Instant.now();
-  }
+  int pageSize = 100;
+  int success = 0;
+  int failed = 0;
+  int skipped = 0;
 
-  public void markFailed(String error) {
-    this.status = "FAILED";
-    this.lastError = error;
-    this.updatedAt = Instant.now();
-  }
+  try {
+    while (true) {
 
-  public void incSuccess() {
-    this.successCount++;
-    this.updatedAt = Instant.now();
-  }
+      // Toujours la "premiere page" des restants
+      List<Long> ids = bucketRepository.findIdsToProcess(
+          runId,
+          Values.STATUS_SUCCESS,
+          ValuesLib.ACTION_DELETE,
+          PageRequest.of(0, pageSize)
+      );
 
-  public void incFailed(String error) {
-    this.failedCount++;
-    this.lastError = error;
-    this.updatedAt = Instant.now();
-  }
+      if (ids.isEmpty()) break;
 
-  public void incSkipped() {
-    this.skippedCount++;
-    this.updatedAt = Instant.now();
+      for (Long id : ids) {
+
+        // Claim atomique: si 0 -> deja pris/traite, on passe
+        if (bucketRepository.claim(id, runId) != 1) {
+          continue;
+        }
+
+        Bucket bucket = null;
+
+        try {
+          waitIfPaused();
+
+          bucket = bucketRepository.findById(id)
+              .orElseThrow(() -> new IllegalStateException("Bucket not found id=" + id));
+
+          // (Optionnel) Si tu veux encore skipper ici, fais-le AVANT l’appel externe
+          // mais normalement findIdsToProcess filtre deja status/action donc skipped ici devrait rester 0
+
+          ValidateGenericAccess vga = apiServicesInterface.validateGenericAccess(
+              bucket.getInstanceCos().getEcosystem(),
+              null,
+              Values.RIGHT_UPDATE,
+              ValuesLib.RESOURCE_BUCKET,
+              authorizationHeaderUtil.getAuthorizationHeader().get()
+          );
+
+          MetierN3 metierN3 = vga.getEcosystem().getMetierN3();
+
+          bucket.bucketAllowedIps(
+              bucketService.mapWhitelistIp(vga).stream()
+                  .map(WhitelistIp::getAddress)
+                  .collect(Collectors.toList())
+                  .toString()
+          );
+
+          bucketService.forceUpdateBucket(bucket, metierN3);
+
+          if (Objects.equals(bucket.getStatus(), Values.STATUS_FAILED)) {
+            throw new CustomGenericException(HttpStatus.INTERNAL_SERVER_ERROR, "ERROR during force update");
+          }
+
+          bucket.setBatchRunStatus("DONE");
+          bucketRepository.save(bucket);
+
+          success++;
+          run.incSuccess();
+
+        } catch (Exception e) {
+          long pauseMs = computePauseMs(e);
+          activatePause(pauseMs);
+
+          if (bucket == null) {
+            bucket = bucketRepository.findById(id).orElse(null);
+          }
+          if (bucket != null) {
+            bucket.setBatchRunStatus("FAILED");
+            // optionnel: bucket.setBatchRunLastError(truncate(e.getMessage()));
+            bucketRepository.save(bucket);
+          }
+
+          failed++;
+          run.incFailed(e.getMessage());
+
+          log.error("Bucket {} failed (pause {}ms)", id, pauseMs, e);
+
+        } finally {
+          // Tu peux optimiser en sauvegardant toutes les 10 iterations si tu veux
+          batchRunRepository.save(run);
+        }
+      }
+    }
+
+    // statut final
+    if (failed > 0) {
+      run.setStatus("DONE_WITH_ERRORS");
+    } else {
+      run.markDone();
+    }
+    batchRunRepository.save(run);
+
+    log.info("Run {} finished: success={} failed={} skipped={}", runId, success, failed, skipped);
+
+  } catch (Exception fatal) {
+    run.markFailed(fatal.getMessage());
+    batchRunRepository.save(run);
+    log.error("Run {} crashed", runId, fatal);
   }
 }
-
-✔ Compatible Java 8
-✔ Lombok propre
-✔ Méthodes utilitaires pour ton batch
-✔ Pas de boilerplate inutile
-
-⸻
-
-3️⃣ Repository BatchRunRepository
-
-import org.springframework.data.jpa.repository.JpaRepository;
-
-public interface BatchRunRepository extends JpaRepository<BatchRun, String> {
-}
-
-
-⸻
-
-4️⃣ Comment l’utiliser dans ton batch async (exemple réel)
-
-Création du run
-
-String runId = UUID.randomUUID().toString();
-
-BatchRun run = BatchRun.newRun(runId, "WHITELIST_FORCE_UPDATE");
-batchRunRepository.save(run);
-
-
-⸻
-
-Démarrage
-
-run.markRunning();
-batchRunRepository.save(run);
-
-
-⸻
-
-Pendant la boucle
-
-try {
-  updater.updateWhitelistForOneBucket(bucket, runId);
-  run.incSuccess();
-} catch (Exception e) {
-  run.incFailed(e.getMessage());
-}
-batchRunRepository.save(run);
-
-
-⸻
-
-Fin
-
-run.markDone();
-batchRunRepository.save(run);
-
-
-⸻
-
-5️⃣ Bonnes pratiques (IMPORTANT)
-
-✅ Ne mets PAS les compteurs uniquement en mémoire
-
-Toujours persister dans BatchRun, sinon tu perds tout si crash.
-
-✅ Sauvegarde le run régulièrement
-
-Tous les X buckets (ex: 10) ou à chaque bucket si tu veux être ultra safe.
-
-✅ Un run = un UUID
-
-Ne réutilise jamais un runId.
-
-⸻
-
-🟢 Conclusion
-
-Tu as maintenant :
-	•	un batch async
-	•	un suivi fiable en base
-	•	une relance possible
-	•	zéro retraitement inutile
-	•	Lombok + Java 8 clean
-
-Si tu veux, je peux maintenant :
-	•	te donner le SQL pour ajouter les champs batchRunId / batchRunStatus sur Bucket
-	•	te montrer le endpoint REST pour suivre le run
-	•	ou t’aider à implémenter le retry FAILED only
-
-Dis-moi 👍
