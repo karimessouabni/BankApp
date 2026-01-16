@@ -1,0 +1,273 @@
+Oui, dans ton cas il faut le lancer async (sinon timeout HTTP), et les compteurs en mémoire ne suffisent plus si tu veux suivre le progrès et surtout éviter de retraiter quand tu relances.
+
+Je te donne une solution simple, propre, et robuste en Spring Boot :
+
+✅ lancement asynchrone
+✅ suivi en base (success/failed/skipped + état RUNNING/DONE)
+✅ reprise / relance sans retraiter les mêmes buckets (via “claim” en DB)
+
+⸻
+
+1) Le bon modèle mental
+
+Tu ne fais plus “une requête HTTP = tout le batch”.
+Tu fais :
+	1.	POST /buckets/whitelist/run → retourne runId
+	2.	En arrière-plan, tu traites les buckets par lots
+	3.	GET /buckets/whitelist/run/{runId} → donne l’avancement
+
+➡️ Donc tes variables success++/failed++ doivent aller en DB, pas en RAM.
+
+⸻
+
+2) Oui : il faut un marqueur en DB pour ne pas retraiter
+
+Tu as déjà des status métier, mais ils ne suffisent pas toujours car :
+	•	un bucket peut être SUCCESS mais pas “déjà traité par CE run”
+	•	tu veux relancer un run sans retraiter ceux déjà faits
+
+✅ Le plus simple : ajouter 2 champs sur Bucket (ou une table à part).
+
+Option A (la plus simple) : champs sur Bucket
+	•	batchRunId (String/UUID)
+	•	batchRunStatus : PENDING | INPROGRESS | DONE | FAILED
+	•	batchRunUpdatedAt (timestamp)
+	•	batchRunAttempts (int)
+
+Tu peux garder tes status métier existants, et utiliser batchRunStatus uniquement pour le batch.
+
+Option B : table séparée bucket_batch_item
+
+Plus clean si tu ne veux pas toucher l’entité Bucket.
+Mais Option A est plus rapide à implémenter.
+
+⸻
+
+3) “Claim” en DB (le truc clé pour ne pas retraiter)
+
+Au lieu de faire findAll(pageable) puis traiter, tu fais :
+	1.	tu prends un lot de buckets “à faire”
+	2.	tu les “claim” (= marquer INPROGRESS) atomiquement
+	3.	tu traites uniquement ceux-là
+
+Exemple (JPA) : requêtes recommandées
+
+(a) Sélection des IDs éligibles
+
+@Query("""
+select b.id from Bucket b
+where (b.batchRunId is null or b.batchRunId = :runId)
+  and (b.batchRunStatus is null or b.batchRunStatus in ('PENDING','FAILED'))
+  and b.status = :requiredStatus
+  and b.action <> :deleteAction
+order by b.id asc
+""")
+List<String> findIdsToProcess(@Param("runId") String runId,
+                              @Param("requiredStatus") String requiredStatus,
+                              @Param("deleteAction") String deleteAction,
+                              Pageable pageable);
+
+(b) Claim atomique
+
+@Modifying
+@Query("""
+update Bucket b
+set b.batchRunId = :runId,
+    b.batchRunStatus = 'INPROGRESS',
+    b.batchRunUpdatedAt = CURRENT_TIMESTAMP,
+    b.batchRunAttempts = coalesce(b.batchRunAttempts,0) + 1
+where b.id = :id
+  and (b.batchRunStatus is null or b.batchRunStatus in ('PENDING','FAILED'))
+""")
+int claim(@Param("id") String id, @Param("runId") String runId);
+
+int claim(...) retourne 1 si tu as réussi à réserver le bucket.
+0 sinon (déjà pris/traité) → tu passes.
+
+⸻
+
+4) Async Spring Boot : comment lancer le job
+
+4.1 Activer async
+
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+  @Bean
+  public Executor batchExecutor() {
+    ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+    exec.setCorePoolSize(1);     // 1 thread = safer contre rate limit
+    exec.setMaxPoolSize(1);
+    exec.setQueueCapacity(10);
+    exec.setThreadNamePrefix("bucket-batch-");
+    exec.initialize();
+    return exec;
+  }
+}
+
+4.2 Service batch async
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BucketBatchRunner {
+
+  private final BucketRepository bucketRepository;
+  private final BucketWhitelistUpdater updater; // ta logique "unitaire"
+  private final BatchRunRepository batchRunRepository; // table de suivi du run
+
+  private volatile long pauseUntilMs = 0; // pause globale
+
+  @Async("batchExecutor")
+  public void runAsync(String runId) {
+    BatchRun run = batchRunRepository.findById(runId).orElseThrow();
+    run.setStatus("RUNNING");
+    batchRunRepository.save(run);
+
+    long success = 0, failed = 0, skipped = 0;
+    int pageSize = 100;
+
+    while (true) {
+      // récupère une petite liste d'IDs
+      List<String> ids = bucketRepository.findIdsToProcess(
+          runId,
+          Values.STATUS_SUCCESS,
+          ValuesLib.ACTION_DELETE,
+          PageRequest.of(0, pageSize)
+      );
+
+      if (ids.isEmpty()) break;
+
+      for (String id : ids) {
+
+        // claim atomique => évite retraitement si relance / concurrence
+        if (bucketRepository.claim(id, runId) != 1) continue;
+
+        try {
+          waitIfPaused();
+
+          Bucket bucket = bucketRepository.findById(id).orElseThrow();
+
+          updater.updateWhitelistForOneBucket(bucket, runId);
+
+          bucket.setBatchRunStatus("DONE");
+          bucketRepository.save(bucket);
+
+          success++;
+          run.setSuccessCount(success);
+
+        } catch (Exception e) {
+          long pauseMs = computePauseMs(e);
+          activatePause(pauseMs);
+
+          Bucket bucket = bucketRepository.findById(id).orElse(null);
+          if (bucket != null) {
+            bucket.setBatchRunStatus("FAILED");
+            // optionnel: bucket.setBatchRunLastError(truncate(e.getMessage()));
+            bucketRepository.save(bucket);
+          }
+
+          failed++;
+          run.setFailedCount(failed);
+          log.error("Bucket {} failed (pause {}ms)", id, pauseMs, e);
+
+        } finally {
+          run.setUpdatedAt(Instant.now());
+          batchRunRepository.save(run);
+        }
+      }
+    }
+
+    run.setStatus("DONE");
+    run.setUpdatedAt(Instant.now());
+    batchRunRepository.save(run);
+
+    log.info("Run {} finished: success={} failed={} skipped={}", runId, success, failed, skipped);
+  }
+
+  private void waitIfPaused() {
+    long now = System.currentTimeMillis();
+    if (pauseUntilMs > now) {
+      try { Thread.sleep(pauseUntilMs - now); }
+      catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+  }
+
+  private void activatePause(long ms) {
+    pauseUntilMs = Math.max(pauseUntilMs, System.currentTimeMillis() + ms);
+  }
+
+  private long computePauseMs(Exception e) {
+    if (e instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests) return 60_000;
+    if (e instanceof org.springframework.web.client.HttpServerErrorException ||
+        e instanceof org.springframework.web.client.ResourceAccessException) return 15_000;
+    return 10_000;
+  }
+}
+
+✅ Ici :
+	•	les compteurs sont persistés dans BatchRun
+	•	les buckets marqués batchRunStatus=DONE/FAILED
+	•	relancer le même runId ne retraitera pas DONE
+	•	relancer un nouveau run peut choisir de reprendre seulement FAILED/PENDING
+
+⸻
+
+5) Endpoints REST
+
+5.1 Lancer
+
+@PostMapping("/whitelist/run")
+public ResponseEntity<Map<String, String>> startRun() {
+  String runId = UUID.randomUUID().toString();
+
+  batchRunRepository.save(new BatchRun(runId, "QUEUED", 0, 0, Instant.now()));
+
+  bucketBatchRunner.runAsync(runId);
+
+  return ResponseEntity.accepted().body(Map.of("runId", runId));
+}
+
+5.2 Voir l’état
+
+@GetMapping("/whitelist/run/{runId}")
+public ResponseEntity<BatchRun> getRun(@PathVariable String runId) {
+  return ResponseEntity.ok(batchRunRepository.findById(runId).orElseThrow());
+}
+
+
+⸻
+
+6) Et si tu relances : comment éviter de retraiter ?
+
+✅ Tu as 2 façons :
+
+Relance “même run”
+	•	tu reprends uniquement FAILED / PENDING du même runId
+
+Nouveau run
+	•	tu sélectionnes seulement les buckets dont batchRunStatus != DONE (ou batchRunUpdatedAt vieux)
+
+⸻
+
+7) Si tu ne veux VRAIMENT PAS modifier la DB Bucket
+
+Alors crée une table bucket_batch_item(run_id, bucket_id, status, attempts, last_error)
+et tu fais le même “claim” mais dans cette table.
+Mais franchement, 2–4 champs sur Bucket c’est le plus rapide.
+
+⸻
+
+Ce que je te recommande (le plus rentable)
+	1.	Ajoute BatchRun (table run) pour stocker successCount/failedCount/status
+	2.	Ajoute sur Bucket : batchRunId + batchRunStatus + batchRunAttempts
+	3.	Implémente le “claim” atomique
+	4.	Lance via @Async sur 1 thread (anti rate limit)
+
+Tu auras un batch fiable, relançable, et sans retraitement.
+
+Si tu veux, je peux te donner le SQL exact (Postgres) pour :
+	•	ajouter les colonnes
+	•	indexer correctement (important pour perf)
+	•	et une requête “retry FAILED only” en 1 ligne.
