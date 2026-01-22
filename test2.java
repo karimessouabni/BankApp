@@ -1,181 +1,115 @@
-Oui — si tu t’en fiches des stats et du “run tracking”, tu peux **supprimer complètement `batch_run`** et faire **uniquement des champs dans `bucket`**. Et oui, à chaque relance tu récupères **les non exécutés** ou **FAILED**.
+Oui — je te fais une version 100% compatible avec ta structure actuelle (computePauseMs, waitIfPaused, activatePause, addEqualJitter) ✅
+Et au passage je corrige un bug important dans ton code actuel :
 
-C’est même la solution **la plus simple**.
+⚠️ Bug actuel
 
----
+Dans ton activatePause() tu fais :
 
-## Ce que tu dois avoir dans `bucket` (minimum viable)
+pauseUnitMs = Math.max(pauseUnitMs, System.currentTimeMillis() + ms);
 
-### Minimum
+Donc pauseUnitMs devient un timestamp (pauseUntil).
 
-* `batch_status` : `PENDING | INPROGRESS | DONE | FAILED`
-* `batch_attempts` (optionnel mais utile)
+Mais dans waitIfPaused() tu fais :
 
-### Recommandé (pour debug)
+Thread.sleep(pauseUnitMs);
 
-* `batch_last_error` (text)
-* `batch_updated_at`
+Là tu utilises ce timestamp comme une durée → ça peut dormir énormément / n’importe comment.
 
-👉 Tu n’as pas besoin de `batch_run_id` si tu ne veux pas gérer des runs distincts.
+✅ La solution : pauseUnitMs doit être traité comme pauseUntilMs (un “jusqu’à quand”), et waitIfPaused() doit dormir le temps restant.
 
----
+⸻
 
-## SQL (Postgres) — uniquement bucket
+✅ Version corrigée + jitter (compatible avec ton code)
 
-```sql
-alter table bucket add column if not exists batch_status varchar(20);
-alter table bucket add column if not exists batch_attempts int not null default 0;
-alter table bucket add column if not exists batch_updated_at timestamp;
-alter table bucket add column if not exists batch_last_error text;
+Tu peux garder le nom pauseUnitMs si tu veux, mais je te conseille pauseUntilMs pour éviter les erreurs.
 
-create index if not exists idx_bucket_batch_status on bucket(batch_status);
-```
+// Si tu peux, renomme : pauseUnitMs -> pauseUntilMs
+private volatile long pauseUntilMs = 0L;
 
----
-
-## Règle de reprise (relance)
-
-À chaque lancement :
-
-* Tu prends : `batch_status is null OR batch_status in ('PENDING','FAILED')`
-* Tu “claim” : tu passes `INPROGRESS` atomiquement
-* Tu exécutes
-* Tu marques `DONE` ou `FAILED`
-
-✅ Résultat : si tu relances, **DONE ne sera jamais retraité**.
-
----
-
-## Claim atomique (le point clé)
-
-### Repository JPA
-
-```java
-public interface BucketRepository extends JpaRepository<Bucket, Long> {
-
-  @Query("""
-    select b.id from Bucket b
-    where (b.batchStatus is null or b.batchStatus in (com.yourpkg.BatchStatus.PENDING, com.yourpkg.BatchStatus.FAILED))
-      and b.status = :requiredStatus
-      and b.action <> :deleteAction
-    order by b.id
-  """)
-  List<Long> findIdsToProcess(@Param("requiredStatus") String requiredStatus,
-                              @Param("deleteAction") String deleteAction,
-                              Pageable pageable);
-
-  @Modifying
-  @Query("""
-    update Bucket b
-    set b.batchStatus = com.yourpkg.BatchStatus.INPROGRESS,
-        b.batchAttempts = b.batchAttempts + 1,
-        b.batchUpdatedAt = CURRENT_TIMESTAMP
-    where b.id = :id
-      and (b.batchStatus is null or b.batchStatus in (com.yourpkg.BatchStatus.PENDING, com.yourpkg.BatchStatus.FAILED))
-  """)
-  int claim(@Param("id") Long id);
-
-  @Modifying
-  @Query("""
-    update Bucket b
-    set b.batchStatus = com.yourpkg.BatchStatus.DONE,
-        b.batchUpdatedAt = CURRENT_TIMESTAMP,
-        b.batchLastError = null
-    where b.id = :id
-  """)
-  int markDone(@Param("id") Long id);
-
-  @Modifying
-  @Query("""
-    update Bucket b
-    set b.batchStatus = com.yourpkg.BatchStatus.FAILED,
-        b.batchUpdatedAt = CURRENT_TIMESTAMP,
-        b.batchLastError = :err
-    where b.id = :id
-  """)
-  int markFailed(@Param("id") Long id, @Param("err") String err);
-}
-```
-
-> Remplace `com.yourpkg` par ton package.
-
----
-
-## Boucle batch async (sans batch_run)
-
-```java
-@Async("batchExecutor")
-@Transactional
-public void runAsync() {
-
-  int pageSize = 100;
-  while (true) {
-
-    List<Long> ids = bucketRepository.findIdsToProcess(
-        Values.STATUS_SUCCESS,
-        ValuesLib.ACTION_DELETE,
-        PageRequest.of(0, pageSize)
-    );
-
-    if (ids.isEmpty()) break;
-
-    for (Long id : ids) {
-
-      if (bucketRepository.claim(id) != 1) continue;
-
-      try {
-        waitIfPaused();
-
-        Bucket bucket = bucketRepository.findById(id).orElseThrow();
-        updater.updateWhitelistForOneBucket(bucket, null); // pas de runId
-
-        bucketRepository.markDone(id);
-
-      } catch (Exception e) {
-        long pauseMs = computePauseMs(e);
-        activatePause(pauseMs);
-
-        bucketRepository.markFailed(id, truncate(e.getMessage(), 2000));
-      }
+private long computePauseMs(Exception e) {
+    if (e instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests) {
+        return 60_000;
     }
-  }
+    if (e instanceof org.springframework.web.client.HttpServerErrorException
+            || e instanceof org.springframework.web.client.ResourceAccessException) {
+        return 15_000;
+    }
+    if (e instanceof CustomGenericException) {
+        return 60_000;
+    }
+    return 10_000;
 }
-```
 
-✅ Redémarrage : il reprend naturellement là où il s’est arrêté.
+private void waitIfPaused() {
+    long now = System.currentTimeMillis();
+    long remaining = pauseUntilMs - now;
 
----
+    if (remaining <= 0) {
+        return; // pas de pause active
+    }
 
-## Important : éviter les “INPROGRESS bloqués” si crash
+    log.info("Batch paused for remainingMs={}", remaining);
+    try {
+        Thread.sleep(remaining);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
 
-Si ton process tombe au milieu, certains buckets resteront `INPROGRESS`.
+private void activatePause(long baseMs) {
+    if (baseMs <= 0) return;
 
-Ajoute une règle de récupération :
+    // ✅ jitter sur la durée (PAS sur currentTimeMillis)
+    long jitteredMs = addEqualJitter(baseMs); // ou full jitter si tu veux
 
-* si `batch_status = INPROGRESS` **et** `batch_updated_at < now - 30min`
-  → considérer comme FAILED ou PENDING.
+    long now = System.currentTimeMillis();
+    long newUntil = now + jitteredMs;
 
-Tu peux faire une requête de reset au début :
+    // ✅ On ne raccourcit jamais une pause déjà active
+    pauseUntilMs = Math.max(pauseUntilMs, newUntil);
 
-```sql
-update bucket
-set batch_status = 'FAILED'
-where batch_status = 'INPROGRESS'
-  and batch_updated_at < now() - interval '30 minutes';
-```
+    log.info("activatePause => baseMs={}, jitteredMs={}, pauseUntilMs={}",
+            baseMs, jitteredMs, pauseUntilMs);
+}
 
-Tu peux aussi le faire en JPA `@Modifying`.
+private long addEqualJitter(long baseMs) {
+    if (baseMs <= 0) return 0L;
+    long half = baseMs / 2;
+    // renvoie [half .. baseMs]
+    return half + java.util.concurrent.ThreadLocalRandom.current().nextLong(half + 1);
+}
 
----
 
-## Conclusion claire
+⸻
 
-✅ Oui, tu peux faire **sans `batch_run`**
-✅ Oui, tu relances et tu traites uniquement :
+Comment l’utiliser dans ton flow
 
-* `NULL / PENDING / FAILED`
-  ✅ Avec `claim` + `DONE`, tu ne retraiteras pas les mêmes.
+À chaque boucle / avant appel API :
 
----
+waitIfPaused();
 
-Si tu me confirmes juste le type de `bucket.id` (Long ou String) et le nom exact de tes colonnes JPA (`status`, `action`), je te renvoie le code final parfaitement aligné à ton projet (sans `com.yourpkg`).
+Quand tu catches une exception :
+
+long ms = computePauseMs(e);
+activatePause(ms);
+
+
+⸻
+
+Option meilleure (si tu veux) : FULL JITTER (plus “standard”)
+
+Si tu veux remplacer addEqualJitter par du full jitter (random 0..base) :
+
+private long addFullJitter(long baseMs) {
+    if (baseMs <= 0) return 0L;
+    return java.util.concurrent.ThreadLocalRandom.current().nextLong(baseMs + 1);
+}
+
+Et dans activatePause :
+
+long jitteredMs = addFullJitter(baseMs);
+
+
+⸻
+
+Si tu me montres où tu appelles waitIfPaused() (avant chaque bucket ? avant chaque requête ?), je te dis l’endroit exact le plus safe pour éviter de relancer des appels trop tôt.
