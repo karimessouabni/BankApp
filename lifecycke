@@ -1,214 +1,76 @@
-Here’s a concise, practical documentation you can reuse internally about Delete Lifecycle Policies in IBM Cloud Object Storage (COS) 👇
+Got it — you’re talking about removing an existing lifecycle policy (or rules) from a bucket, not about the delete actions. Here’s a clean, practical doc you can reuse 👇
 
 ⸻
 
-📄 IBM COS – Delete Lifecycle Policy (Quick Guide)
+📄 IBM COS – Deleting / Updating Lifecycle Policies
 
-🔎 What is a Lifecycle Policy?
+🔎 Overview
 
-A Lifecycle Policy in IBM Cloud Object Storage allows you to automatically manage objects in a bucket over time.
+In IBM Cloud Object Storage (COS), lifecycle configuration is handled as a single policy document per bucket.
 
-👉 For deletion, it defines when objects (or parts of objects) should be automatically removed to:
+👉 Important:
 
-* reduce storage costs
-* clean unused or temporary data
-* enforce retention strategies
+* You cannot delete a single rule directly
+* You must update the entire lifecycle configuration
+* Or remove it completely
 
 ⸻
 
-🗑️ Delete Actions Supported
+🧠 Key Principle
 
-1. Expiration (Object Deletion)
+Lifecycle = 1 configuration JSON per bucket
 
-Automatically deletes objects after a defined time.
+So:
 
-* Based on:
-    * object age (in days)
-    * or a specific date
-* Applies to:
-    * current object versions
+* Modify rule → update full config
+* Delete rule → remove it from JSON and reapply
+* Delete all rules → delete lifecycle configuration
+
+⸻
+
+🗑️ Option 1 — Delete Entire Lifecycle Policy
+
+Using AWS CLI (recommended)
+
+aws s3api delete-bucket-lifecycle \
+  --bucket BUCKET_NAME \
+  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+
+👉 Result:
+
+* All lifecycle rules are removed
+* Bucket no longer has any automatic cleanup
+
+⸻
+
+✏️ Option 2 — Remove a Specific Rule
+
+Step 1: Get current lifecycle config
+
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket BUCKET_NAME \
+  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+
+⸻
+
+Step 2: Edit JSON
+
+Remove the rule you don’t want.
 
 Example:
 
-{
-  "Expiration": {
-    "Days": 30
-  }
-}
-
-👉 Deletes objects 30 days after creation
-
-⸻
-
-2. Noncurrent Version Expiration (Versioned buckets)
-
-If versioning is enabled, older versions can be deleted.
-
-{
-  "NoncurrentVersionExpiration": {
-    "NoncurrentDays": 15
-  }
-}
-
-👉 Deletes previous versions after 15 days
-
-⸻
-
-3. Abort Incomplete Multipart Uploads ⚠️ (Very important)
-
-Cleans up unfinished uploads.
-
-{
-  "AbortIncompleteMultipartUpload": {
-    "DaysAfterInitiation": 7
-  }
-}
-
-👉 Deletes:
-
-* incomplete uploads
-* uploaded parts not finalized
-
-💡 Critical for:
-
-* avoiding hidden storage costs
-* cleaning failed uploads / crashes
-
-⸻
-
-⚙️ How It Works
-
-* Lifecycle rules are:
-    * evaluated once per day
-    * applied asynchronously
-* Deletion is:
-    * not immediate
-    * may take hours after the threshold is reached
-
-⸻
-
-⚠️ Important Considerations
-
-1. ❗ Irreversible Deletion
-
-* Deleted objects cannot be recovered
-* No recycle bin
-
-⸻
-
-2. ⏱️ Not Real-Time
-
-* Even if rule = 1 day
-* deletion may occur later (eventual consistency)
-
-⸻
-
-3. 📦 Storage Still Billed Until Deletion
-
-* Objects remain billed until actually removed
-* Especially important for:
-    * multipart uploads
-    * noncurrent versions
-
-⸻
-
-4. 🔐 Permissions Required
-
-To configure lifecycle:
-
-* Manager or appropriate IAM role required
-
-⸻
-
-5. 🧠 Versioning Impact
-
-If versioning is ON:
-
-* Expiration only deletes current version
-* older versions stay unless:
-    * NoncurrentVersionExpiration is configured
-
-⸻
-
-6. 🧪 Multipart Uploads Are Hidden
-
-* Incomplete uploads:
-    * are not visible as objects
-    * but consume storage
-* Must use:
-    * AbortIncompleteMultipartUpload to clean them
-
-⸻
-
-7. 📍 Region / Endpoint Consistency
-
-* Lifecycle applies at bucket level
-* Ensure:
-    * correct bucket region
-    * correct endpoint when testing
-
-⸻
-
-🧪 Best Practices
-
-✅ Always define cleanup for multipart uploads
-
-"AbortIncompleteMultipartUpload": {
-  "DaysAfterInitiation": 1
-}
-
-⸻
-
-✅ Combine rules
-
-Example:
-
-* delete objects after 30 days
-* delete old versions after 15 days
-* cleanup multipart after 1 day
-
-⸻
-
-✅ Test before production
-
-* simulate:
-    * incomplete multipart uploads
-    * versioned objects
-
-⸻
-
-✅ Monitor storage usage
-
-* lifecycle misconfig = hidden costs
-
-⸻
-
-🚨 Common Pitfalls
-
-* ❌ Forgetting multipart cleanup → storage leaks
-* ❌ Assuming immediate deletion
-* ❌ Using expiration without version cleanup
-* ❌ Wrong prefix/filter → rule not applied
-* ❌ Testing on wrong bucket/region
-
-⸻
-
-🧩 Example Full Policy
+Before:
 
 {
   "Rules": [
     {
-      "ID": "cleanup-rule",
+      "ID": "delete-after-30-days",
       "Status": "Enabled",
-      "Filter": {
-        "Prefix": ""
-      },
-      "Expiration": {
-        "Days": 30
-      },
-      "NoncurrentVersionExpiration": {
-        "NoncurrentDays": 15
-      },
+      "Expiration": { "Days": 30 }
+    },
+    {
+      "ID": "cleanup-multipart",
+      "Status": "Enabled",
       "AbortIncompleteMultipartUpload": {
         "DaysAfterInitiation": 1
       }
@@ -216,22 +78,102 @@ Example:
   ]
 }
 
+After (remove multipart rule):
+
+{
+  "Rules": [
+    {
+      "ID": "delete-after-30-days",
+      "Status": "Enabled",
+      "Expiration": { "Days": 30 }
+    }
+  ]
+}
+
+⸻
+
+Step 3: Apply updated config
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket BUCKET_NAME \
+  --lifecycle-configuration file://lifecycle.json \
+  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+
+⸻
+
+⚠️ Important Considerations
+
+1. ❗ No Partial Delete API
+
+* No command like “delete rule X”
+* Always full overwrite
+
+⸻
+
+2. ⚠️ Overwrite Risk
+
+* put-bucket-lifecycle-configuration replaces everything
+* If you forget a rule → it is deleted
+
+👉 Always:
+
+* backup config before editing
+
+⸻
+
+3. ⏱️ Effect is Not Immediate
+
+* Lifecycle engine runs asynchronously
+* Changes may take time to apply
+
+⸻
+
+4. 🔄 Existing Objects Are Not Reverted
+
+* If objects were already deleted → irreversible
+* Removing a rule does NOT restore anything
+
+⸻
+
+5. 🧪 Safe Approach
+
+Best practice:
+
+1. get config
+2. modify locally
+3. reapply
+4. verify
+
+⸻
+
+🔍 Verification
+
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket BUCKET_NAME \
+  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+
+⸻
+
+🚨 Common Pitfalls
+
+* ❌ Forgetting other rules when updating → accidental deletion
+* ❌ Wrong endpoint/region → config applied to wrong bucket or fails
+* ❌ Assuming rule deletion is immediate
+* ❌ Not backing up original config
+
 ⸻
 
 🧠 Summary
 
-A delete lifecycle policy in IBM COS:
-
-* automates data cleanup
-* reduces costs
-* must be carefully configured (especially with versioning and multipart uploads)
-
-👉 The most critical rule in real systems:
-AbortIncompleteMultipartUpload
+* Lifecycle config = single JSON document
+* No per-rule delete → must update or remove full config
+* Use:
+    * delete-bucket-lifecycle → remove all
+    * put-bucket-lifecycle-configuration → update rules
 
 ⸻
 
-If you want, I can tailor this doc to:
+If you want, I can give you:
 
-* your exact bucket setup (versioning ON/OFF)
-* or turn it into a Confluence / README format ready to share with your team 👍
+* a ready-to-use script that safely removes one rule (no risk of deleting others)
+* or a Terraform-safe approach (very useful if you manage COS infra as code)
