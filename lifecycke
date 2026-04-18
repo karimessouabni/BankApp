@@ -1,179 +1,163 @@
-Got it — you’re talking about removing an existing lifecycle policy (or rules) from a bucket, not about the delete actions. Here’s a clean, practical doc you can reuse 👇
+Here’s a clean Confluence-ready version (no images, simple formatting, user-focused) 👇
 
 ⸻
 
-📄 IBM COS – Deleting / Updating Lifecycle Policies
+Update Life Cycle Policy – User Guide (IBM COS)
 
-🔎 Overview
+Purpose
 
-In IBM Cloud Object Storage (COS), lifecycle configuration is handled as a single policy document per bucket.
+This form allows you to create or update a lifecycle rule on a bucket.
 
-👉 Important:
+A lifecycle rule automatically deletes:
 
-* You cannot delete a single rule directly
-* You must update the entire lifecycle configuration
-* Or remove it completely
-
-⸻
-
-🧠 Key Principle
-
-Lifecycle = 1 configuration JSON per bucket
-
-So:
-
-* Modify rule → update full config
-* Delete rule → remove it from JSON and reapply
-* Delete all rules → delete lifecycle configuration
+* current objects after a defined number of days
+* or old versions of objects (if versioning is enabled)
 
 ⸻
 
-🗑️ Option 1 — Delete Entire Lifecycle Policy
+⚠️ Important
 
-Using AWS CLI (recommended)
+When you use this form, you are modifying the automatic deletion behavior of the bucket, not just adding a simple setting.
 
-aws s3api delete-bucket-lifecycle \
-  --bucket BUCKET_NAME \
-  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
-
-👉 Result:
-
-* All lifecycle rules are removed
-* Bucket no longer has any automatic cleanup
+Changes can impact a large number of objects.
 
 ⸻
 
-✏️ Option 2 — Remove a Specific Rule
+Updating an Existing Rule
 
-Step 1: Get current lifecycle config
+If you use the same rule name (Rule ID):
 
-aws s3api get-bucket-lifecycle-configuration \
-  --bucket BUCKET_NAME \
-  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+* The existing rule will be updated
+* New values (days, prefix) will replace the previous ones
+
+Impact
+
+* Objects that matched the rule will now follow the new conditions
+* This may result in:
+    * earlier deletion of data
+    * or longer retention
 
 ⸻
 
-Step 2: Edit JSON
+Creating a New Rule
 
-Remove the rule you don’t want.
+If you use a new rule name:
+
+* A new lifecycle rule will be created
+
+Impact
+
+* It may apply to:
+    * the entire bucket (if no prefix is set)
+    * or a subset of objects (if a prefix is defined)
+* Multiple rules can exist at the same time
+
+⸻
+
+⚠️ Key Points to Watch
+
+1. Deletion is permanent
+
+* Deleted objects cannot be recovered
+* There is no undo
+
+⸻
+
+2. Changing “Expiration days” affects future deletions
 
 Example:
 
-Before:
+* Before: 30 days
+* After: 5 days
 
-{
-  "Rules": [
-    {
-      "ID": "delete-after-30-days",
-      "Status": "Enabled",
-      "Expiration": { "Days": 30 }
-    },
-    {
-      "ID": "cleanup-multipart",
-      "Status": "Enabled",
-      "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": 1
-      }
-    }
-  ]
-}
+Result:
 
-After (remove multipart rule):
-
-{
-  "Rules": [
-    {
-      "ID": "delete-after-30-days",
-      "Status": "Enabled",
-      "Expiration": { "Days": 30 }
-    }
-  ]
-}
+* Many objects may quickly become eligible for deletion
 
 ⸻
 
-Step 3: Apply updated config
+3. Prefix defines the scope
 
-aws s3api put-bucket-lifecycle-configuration \
-  --bucket BUCKET_NAME \
-  --lifecycle-configuration file://lifecycle.json \
-  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+* Empty prefix → applies to the entire bucket
+* Defined prefix → applies only to matching objects
 
-⸻
+Be careful:
 
-⚠️ Important Considerations
-
-1. ❗ No Partial Delete API
-
-* No command like “delete rule X”
-* Always full overwrite
+* Leaving the prefix empty unintentionally may affect all data
 
 ⸻
 
-2. ⚠️ Overwrite Risk
+4. Versioning considerations
 
-* put-bucket-lifecycle-configuration replaces everything
-* If you forget a rule → it is deleted
+If versioning is enabled:
 
-👉 Always:
+* Deleting current objects does not delete old versions
+* Old versions may still consume storage
 
-* backup config before editing
-
-⸻
-
-3. ⏱️ Effect is Not Immediate
-
-* Lifecycle engine runs asynchronously
-* Changes may take time to apply
+Use “Non current version expiration days” if needed
 
 ⸻
 
-4. 🔄 Existing Objects Are Not Reverted
+5. Changes are not immediate
 
-* If objects were already deleted → irreversible
-* Removing a rule does NOT restore anything
-
-⸻
-
-5. 🧪 Safe Approach
-
-Best practice:
-
-1. get config
-2. modify locally
-3. reapply
-4. verify
+* Updates are applied automatically in the background
+* Deletion may happen with a delay (not instantly)
 
 ⸻
 
-🔍 Verification
+6. Existing rules may be affected
 
-aws s3api get-bucket-lifecycle-configuration \
-  --bucket BUCKET_NAME \
-  --endpoint-url https://s3.REGION.cloud-object-storage.appdomain.cloud
+Depending on the configuration:
 
-⸻
+* Updating a rule may impact other existing rules
 
-🚨 Common Pitfalls
+Recommendation:
 
-* ❌ Forgetting other rules when updating → accidental deletion
-* ❌ Wrong endpoint/region → config applied to wrong bucket or fails
-* ❌ Assuming rule deletion is immediate
-* ❌ Not backing up original config
+* Always review existing lifecycle rules before updating
 
 ⸻
 
-🧠 Summary
+✅ Best Practices
 
-* Lifecycle config = single JSON document
-* No per-rule delete → must update or remove full config
-* Use:
-    * delete-bucket-lifecycle → remove all
-    * put-bucket-lifecycle-configuration → update rules
+* Use clear and descriptive rule names (e.g., logs-30d, tmp-cleanup)
+* Double-check the prefix before applying changes
+* Be cautious when reducing expiration days
+* Review existing rules before updating
+* Start with higher values if unsure
 
 ⸻
 
-If you want, I can give you:
+Examples
 
-* a ready-to-use script that safely removes one rule (no risk of deleting others)
-* or a Terraform-safe approach (very useful if you manage COS infra as code)
+Safe update
+
+Change from 30 → 60 days
+→ Keeps data longer
+
+⸻
+
+Risky update
+
+Change from 30 → 1 day
+→ May delete large amounts of data quickly
+
+⸻
+
+Common mistake
+
+Leaving prefix empty unintentionally
+→ Rule applies to the entire bucket
+
+⸻
+
+Summary
+
+This form controls automatic data deletion at scale.
+
+Main risks:
+
+* updating an existing rule changes behavior
+* incorrect prefix affects the wrong data
+* shorter durations lead to faster deletion
+
+Always review your configuration carefully before applying changes.
