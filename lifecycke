@@ -1,0 +1,237 @@
+Here’s a concise, practical documentation you can reuse internally about Delete Lifecycle Policies in IBM Cloud Object Storage (COS) 👇
+
+⸻
+
+📄 IBM COS – Delete Lifecycle Policy (Quick Guide)
+
+🔎 What is a Lifecycle Policy?
+
+A Lifecycle Policy in IBM Cloud Object Storage allows you to automatically manage objects in a bucket over time.
+
+👉 For deletion, it defines when objects (or parts of objects) should be automatically removed to:
+
+* reduce storage costs
+* clean unused or temporary data
+* enforce retention strategies
+
+⸻
+
+🗑️ Delete Actions Supported
+
+1. Expiration (Object Deletion)
+
+Automatically deletes objects after a defined time.
+
+* Based on:
+    * object age (in days)
+    * or a specific date
+* Applies to:
+    * current object versions
+
+Example:
+
+{
+  "Expiration": {
+    "Days": 30
+  }
+}
+
+👉 Deletes objects 30 days after creation
+
+⸻
+
+2. Noncurrent Version Expiration (Versioned buckets)
+
+If versioning is enabled, older versions can be deleted.
+
+{
+  "NoncurrentVersionExpiration": {
+    "NoncurrentDays": 15
+  }
+}
+
+👉 Deletes previous versions after 15 days
+
+⸻
+
+3. Abort Incomplete Multipart Uploads ⚠️ (Very important)
+
+Cleans up unfinished uploads.
+
+{
+  "AbortIncompleteMultipartUpload": {
+    "DaysAfterInitiation": 7
+  }
+}
+
+👉 Deletes:
+
+* incomplete uploads
+* uploaded parts not finalized
+
+💡 Critical for:
+
+* avoiding hidden storage costs
+* cleaning failed uploads / crashes
+
+⸻
+
+⚙️ How It Works
+
+* Lifecycle rules are:
+    * evaluated once per day
+    * applied asynchronously
+* Deletion is:
+    * not immediate
+    * may take hours after the threshold is reached
+
+⸻
+
+⚠️ Important Considerations
+
+1. ❗ Irreversible Deletion
+
+* Deleted objects cannot be recovered
+* No recycle bin
+
+⸻
+
+2. ⏱️ Not Real-Time
+
+* Even if rule = 1 day
+* deletion may occur later (eventual consistency)
+
+⸻
+
+3. 📦 Storage Still Billed Until Deletion
+
+* Objects remain billed until actually removed
+* Especially important for:
+    * multipart uploads
+    * noncurrent versions
+
+⸻
+
+4. 🔐 Permissions Required
+
+To configure lifecycle:
+
+* Manager or appropriate IAM role required
+
+⸻
+
+5. 🧠 Versioning Impact
+
+If versioning is ON:
+
+* Expiration only deletes current version
+* older versions stay unless:
+    * NoncurrentVersionExpiration is configured
+
+⸻
+
+6. 🧪 Multipart Uploads Are Hidden
+
+* Incomplete uploads:
+    * are not visible as objects
+    * but consume storage
+* Must use:
+    * AbortIncompleteMultipartUpload to clean them
+
+⸻
+
+7. 📍 Region / Endpoint Consistency
+
+* Lifecycle applies at bucket level
+* Ensure:
+    * correct bucket region
+    * correct endpoint when testing
+
+⸻
+
+🧪 Best Practices
+
+✅ Always define cleanup for multipart uploads
+
+"AbortIncompleteMultipartUpload": {
+  "DaysAfterInitiation": 1
+}
+
+⸻
+
+✅ Combine rules
+
+Example:
+
+* delete objects after 30 days
+* delete old versions after 15 days
+* cleanup multipart after 1 day
+
+⸻
+
+✅ Test before production
+
+* simulate:
+    * incomplete multipart uploads
+    * versioned objects
+
+⸻
+
+✅ Monitor storage usage
+
+* lifecycle misconfig = hidden costs
+
+⸻
+
+🚨 Common Pitfalls
+
+* ❌ Forgetting multipart cleanup → storage leaks
+* ❌ Assuming immediate deletion
+* ❌ Using expiration without version cleanup
+* ❌ Wrong prefix/filter → rule not applied
+* ❌ Testing on wrong bucket/region
+
+⸻
+
+🧩 Example Full Policy
+
+{
+  "Rules": [
+    {
+      "ID": "cleanup-rule",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": ""
+      },
+      "Expiration": {
+        "Days": 30
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 15
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}
+
+⸻
+
+🧠 Summary
+
+A delete lifecycle policy in IBM COS:
+
+* automates data cleanup
+* reduces costs
+* must be carefully configured (especially with versioning and multipart uploads)
+
+👉 The most critical rule in real systems:
+AbortIncompleteMultipartUpload
+
+⸻
+
+If you want, I can tailor this doc to:
+
+* your exact bucket setup (versioning ON/OFF)
+* or turn it into a Confluence / README format ready to share with your team 👍
