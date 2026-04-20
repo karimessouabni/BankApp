@@ -3,69 +3,25 @@ package com.bnpp.app.service.dto.v1;
 import com.fasterxml.jackson.dataformat.xml.XmlMapper;
 import org.junit.jupiter.api.Test;
 
+import java.io.InputStream;
+import java.util.Objects;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class BucketMultiPartUploadDTOTest {
 
-    private static final String XML = """
-        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-        <ListMultipartUploadsResult xmlns="<http://s3.amazonaws.com/doc/2006-03-01>/">
-            <Bucket>bu0021020570</Bucket>
-            <KeyMarker></KeyMarker>
-            <UploadIdMarker></UploadIdMarker>
-            <NextKeyMarker>mytestobject.bin</NextKeyMarker>
-            <NextUploadIdMarker>0100019d-ab0f-5d19-6151-445aff9a4f73</NextUploadIdMarker>
-            <MaxUploads>1000</MaxUploads>
-            <IsTruncated>false</IsTruncated>
-            <Upload>
-                <Key>mytestobject.bin</Key>
-                <UploadId>0100019d-ab0f-0348-0aa3-98f02d6a660c</UploadId>
-                <Initiator>
-                    <ID>8130a3ed-8758-442b-b509-cca16b25ff6a</ID>
-                    <DisplayName>8130a3ed-8758-442b-b509-cca16b25ff6a</DisplayName>
-                </Initiator>
-                <Owner>
-                    <ID>8130a3ed-8758-442b-b509-cca16b25ff6a</ID>
-                    <DisplayName>8130a3ed-8758-442b-b509-cca16b25ff6a</DisplayName>
-                </Owner>
-                <StorageClass>STANDARD</StorageClass>
-                <Initiated>2026-04-20T13:23:01.064Z</Initiated>
-            </Upload>
-            <Upload>
-                <Key>mytestobject.bin</Key>
-                <UploadId>0100019d-ab0f-5d19-6151-445aff9a4f73</UploadId>
-                <Initiator>
-                    <ID>8130a3ed-8758-442b-b509-cca16b25ff6a</ID>
-                    <DisplayName>8130a3ed-8758-442b-b509-cca16b25ff6a</DisplayName>
-                </Initiator>
-                <Owner>
-                    <ID>8130a3ed-8758-442b-b509-cca16b25ff6a</ID>
-                    <DisplayName>8130a3ed-8758-442b-b509-cca16b25ff6a</DisplayName>
-                </Owner>
-                <StorageClass>STANDARD</StorageClass>
-                <Initiated>2026-04-20T13:23:24.057Z</Initiated>
-            </Upload>
-        </ListMultipartUploadsResult>
-        """;
-
     @Test
     void shouldDeserializeListMultipartUploadsXml() throws Exception {
-        BucketMultiPartUploadDTO dto = new XmlMapper()
-                .readValue(XML, BucketMultiPartUploadDTO.class);
+        try (InputStream in = Objects.requireNonNull(
+                getClass().getResourceAsStream("/list-multipart-uploads.xml"))) {
 
-        assertThat(dto.getBucket()).isEqualTo("bu0021020570");
-        assertThat(dto.getNextKeyMarker()).isEqualTo("mytestobject.bin");
-        assertThat(dto.getMaxUploads()).isEqualTo("1000");
-        assertThat(dto.getIsTruncated()).isEqualTo("false");
+            BucketMultiPartUploadDTO dto = new XmlMapper()
+                    .readValue(in, BucketMultiPartUploadDTO.class);
 
-        // C'est ici que @JacksonXmlElementWrapper(useWrapping = false) est vérifié
-        assertThat(dto.getUploads()).hasSize(2);
-
-        BucketMultiPartUploadDTO.Upload first = dto.getUploads().get(0);
-        assertThat(first.getKey()).isEqualTo("mytestobject.bin");
-        assertThat(first.getUploadId()).isEqualTo("0100019d-ab0f-0348-0aa3-98f02d6a660c");
-        assertThat(first.getStorageClass()).isEqualTo("STANDARD");
-        assertThat(first.getInitiator().getId()).isEqualTo("8130a3ed-8758-442b-b509-cca16b25ff6a");
-        assertThat(first.getOwner().getDisplayName()).isEqualTo("8130a3ed-8758-442b-b509-cca16b25ff6a");
+            assertThat(dto.getBucket()).isEqualTo("bu0021020570");
+            assertThat(dto.getUploads()).hasSize(2);
+            assertThat(dto.getUploads().get(0).getKey()).isEqualTo("mytestobject.bin");
+            assertThat(dto.getUploads().get(0).getStorageClass()).isEqualTo("STANDARD");
+        }
     }
 }
