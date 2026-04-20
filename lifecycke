@@ -1,53 +1,56 @@
+
 #!/bin/bash
 
-TOKEN="$token"
-ENDPOINT="https://$ENDPOINT"
-BUCKET="$BUCKET"
-OBJECT_KEY="my-big-file.zip"
-FILE_PATH="/path/to/my-big-file.zip"
+set -euo pipefail
 
-# 1) Initier le multipart upload
-INIT_XML=$(curl -s -X POST \
-  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?uploads" \
+TOKEN="${TOKEN:-$token}"
+ENDPOINT="${ENDPOINT:?missing ENDPOINT}"   # ex: s3.direct.eu-de.cloud-object-storage.appdomain.cloud
+BUCKET="${BUCKET:?missing BUCKET}"
+OBJECT_KEY="${1:-test-multipart.bin}"
+FILE_PATH="${2:-/tmp/test-part.bin}"
+
+BASE_URL="https://${ENDPOINT}/${BUCKET}/${OBJECT_KEY}"
+
+echo "1) Initiating multipart upload for ${OBJECT_KEY}..."
+
+INIT_XML=$(curl -sS -X POST \
+  "${BASE_URL}?uploads" \
   -H "Authorization: Bearer ${TOKEN}")
 
-echo "Init response:"
 echo "$INIT_XML"
 
 UPLOAD_ID=$(echo "$INIT_XML" | xmllint --xpath 'string(//*[local-name()="UploadId"])' - 2>/dev/null)
 
-if [[ -z "$UPLOAD_ID" ]]; then
-  echo "Impossible de récupérer UploadId"
+if [[ -z "${UPLOAD_ID}" ]]; then
+  echo "ERROR: UploadId not found"
   exit 1
 fi
 
-echo "UploadId: $UPLOAD_ID"
+echo "UploadId: ${UPLOAD_ID}"
+echo
 
-# 2) Exemple : upload d'une seule part
-# Pour un vrai gros fichier, il faut le découper en plusieurs morceaux
-ETAG_1=$(curl -s -D - -o /dev/null -X PUT \
-  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?partNumber=1&uploadId=${UPLOAD_ID}" \
+echo "2) Uploading part 1 from file: ${FILE_PATH}"
+
+HEADERS=$(mktemp)
+
+curl -sS -o /dev/null -D "${HEADERS}" -X PUT \
+  "${BASE_URL}?partNumber=1&uploadId=${UPLOAD_ID}" \
   -H "Authorization: Bearer ${TOKEN}" \
-  --data-binary @"$FILE_PATH" \
-  | awk -F': ' '/ETag/ {gsub("\r","",$2); print $2}')
+  --data-binary @"${FILE_PATH}"
 
-echo "ETag part 1: $ETAG_1"
+ETAG=$(awk -F': ' 'tolower($1)=="etag" {gsub("\r","",$2); print $2}' "${HEADERS}")
+rm -f "${HEADERS}"
 
-# 3) Finaliser le multipart upload
-cat > complete.xml <<EOF
-<CompleteMultipartUpload>
-  <Part>
-    <PartNumber>1</PartNumber>
-    <ETag>${ETAG_1}</ETag>
-  </Part>
-</CompleteMultipartUpload>
-EOF
-
-COMPLETE_RESP=$(curl -s -X POST \
-  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?uploadId=${UPLOAD_ID}" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/xml" \
-  --data-binary @complete.xml)
-
-echo "Complete response:"
-echo "$COMPLETE_RESP"
+echo "Part 1 uploaded."
+echo "ETag: ${ETAG}"
+echo
+echo "3) Stop here on purpose."
+echo "Multipart upload left incomplete for testing."
+echo "Object key : ${OBJECT_KEY}"
+echo "UploadId   : ${UPLOAD_ID}"
+echo
+echo "You can now verify it with:"
+echo "curl -sS -X GET \"${BASE_URL}?uploads\" -H \"Authorization: Bearer ${TOKEN}\""
+echo
+echo "And abort it later with:"
+echo "curl -sS -X DELETE \"${BASE_URL}?uploadId=${UPLOAD_ID}\" -H \"Authorization: Bearer ${TOKEN}\""
