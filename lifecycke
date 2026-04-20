@@ -1,163 +1,53 @@
-Here’s a clean Confluence-ready version (no images, simple formatting, user-focused) 👇
-
-⸻
-
-Update Life Cycle Policy – User Guide (IBM COS)
-
-Purpose
-
-This form allows you to create or update a lifecycle rule on a bucket.
-
-A lifecycle rule automatically deletes:
-
-* current objects after a defined number of days
-* or old versions of objects (if versioning is enabled)
-
-⸻
-
-⚠️ Important
-
-When you use this form, you are modifying the automatic deletion behavior of the bucket, not just adding a simple setting.
-
-Changes can impact a large number of objects.
-
-⸻
-
-Updating an Existing Rule
-
-If you use the same rule name (Rule ID):
-
-* The existing rule will be updated
-* New values (days, prefix) will replace the previous ones
-
-Impact
-
-* Objects that matched the rule will now follow the new conditions
-* This may result in:
-    * earlier deletion of data
-    * or longer retention
-
-⸻
-
-Creating a New Rule
-
-If you use a new rule name:
-
-* A new lifecycle rule will be created
-
-Impact
-
-* It may apply to:
-    * the entire bucket (if no prefix is set)
-    * or a subset of objects (if a prefix is defined)
-* Multiple rules can exist at the same time
-
-⸻
-
-⚠️ Key Points to Watch
-
-1. Deletion is permanent
-
-* Deleted objects cannot be recovered
-* There is no undo
-
-⸻
-
-2. Changing “Expiration days” affects future deletions
-
-Example:
-
-* Before: 30 days
-* After: 5 days
-
-Result:
-
-* Many objects may quickly become eligible for deletion
-
-⸻
-
-3. Prefix defines the scope
-
-* Empty prefix → applies to the entire bucket
-* Defined prefix → applies only to matching objects
-
-Be careful:
-
-* Leaving the prefix empty unintentionally may affect all data
-
-⸻
-
-4. Versioning considerations
-
-If versioning is enabled:
-
-* Deleting current objects does not delete old versions
-* Old versions may still consume storage
-
-Use “Non current version expiration days” if needed
-
-⸻
-
-5. Changes are not immediate
-
-* Updates are applied automatically in the background
-* Deletion may happen with a delay (not instantly)
-
-⸻
-
-6. Existing rules may be affected
-
-Depending on the configuration:
-
-* Updating a rule may impact other existing rules
-
-Recommendation:
-
-* Always review existing lifecycle rules before updating
-
-⸻
-
-✅ Best Practices
-
-* Use clear and descriptive rule names (e.g., logs-30d, tmp-cleanup)
-* Double-check the prefix before applying changes
-* Be cautious when reducing expiration days
-* Review existing rules before updating
-* Start with higher values if unsure
-
-⸻
-
-Examples
-
-Safe update
-
-Change from 30 → 60 days
-→ Keeps data longer
-
-⸻
-
-Risky update
-
-Change from 30 → 1 day
-→ May delete large amounts of data quickly
-
-⸻
-
-Common mistake
-
-Leaving prefix empty unintentionally
-→ Rule applies to the entire bucket
-
-⸻
-
-Summary
-
-This form controls automatic data deletion at scale.
-
-Main risks:
-
-* updating an existing rule changes behavior
-* incorrect prefix affects the wrong data
-* shorter durations lead to faster deletion
-
-Always review your configuration carefully before applying changes.
+#!/bin/bash
+
+TOKEN="$token"
+ENDPOINT="https://$ENDPOINT"
+BUCKET="$BUCKET"
+OBJECT_KEY="my-big-file.zip"
+FILE_PATH="/path/to/my-big-file.zip"
+
+# 1) Initier le multipart upload
+INIT_XML=$(curl -s -X POST \
+  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?uploads" \
+  -H "Authorization: Bearer ${TOKEN}")
+
+echo "Init response:"
+echo "$INIT_XML"
+
+UPLOAD_ID=$(echo "$INIT_XML" | xmllint --xpath 'string(//*[local-name()="UploadId"])' - 2>/dev/null)
+
+if [[ -z "$UPLOAD_ID" ]]; then
+  echo "Impossible de récupérer UploadId"
+  exit 1
+fi
+
+echo "UploadId: $UPLOAD_ID"
+
+# 2) Exemple : upload d'une seule part
+# Pour un vrai gros fichier, il faut le découper en plusieurs morceaux
+ETAG_1=$(curl -s -D - -o /dev/null -X PUT \
+  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?partNumber=1&uploadId=${UPLOAD_ID}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  --data-binary @"$FILE_PATH" \
+  | awk -F': ' '/ETag/ {gsub("\r","",$2); print $2}')
+
+echo "ETag part 1: $ETAG_1"
+
+# 3) Finaliser le multipart upload
+cat > complete.xml <<EOF
+<CompleteMultipartUpload>
+  <Part>
+    <PartNumber>1</PartNumber>
+    <ETag>${ETAG_1}</ETag>
+  </Part>
+</CompleteMultipartUpload>
+EOF
+
+COMPLETE_RESP=$(curl -s -X POST \
+  "${ENDPOINT}/${BUCKET}/${OBJECT_KEY}?uploadId=${UPLOAD_ID}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/xml" \
+  --data-binary @complete.xml)
+
+echo "Complete response:"
+echo "$COMPLETE_RESP"
