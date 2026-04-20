@@ -1,67 +1,147 @@
 import logging
 
-import requests
-
-from cos_service.services.ibm_endpoints import get_cos_control_endpoint
+from pydantic import Field
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT_SECONDS = 30
+
+# "payload": {"backup_vault_name": "my-backup-vault"}
+#    {
+#        "product_branch": "main",
+#        "payload": {"backup_vault_name": "my-backup-vault"}
+#    }
 
 
-def list_recovery_ranges(backup_vault_name: str, access_token: str) -> list:
-    """
-    List all recovery ranges available on a backup vault.
-
-    IBM COS: GET {cos_control_endpoint}/backup_vaults/{backup_vault_name}/recovery_ranges
-    """
-    url = f"{get_cos_control_endpoint()}/backup_vaults/{backup_vault_name}/recovery_ranges"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-    }
-
-    recovery_ranges: list = []
-    next_token: str | None = None
-
-    while True:
-        params = {"token": next_token} if next_token else None
-        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        body = response.json()
-
-        recovery_ranges.extend(body.get("recovery_ranges", []))
-
-        next_token = body.get("next", {}).get("token") if isinstance(body.get("next"), dict) else None
-        if not next_token:
-            break
-
-    return recovery_ranges
+class BucketRestoreBackupVaultPayload(ProductActionPayload):
+    backup_vault_name: str = Field(min_length=3, max_length=63)
 
 
-def start_restore_from_recovery_range(
-        backup_vault_name: str,
-        restore_payload: dict,
-        access_token: str,
-) -> dict:
-    """
-    Initiate an in-place restore on a backup vault from a given recovery range.
+@product_action("cos.bucket.v1.restore_backup_vault", tags=["cos"],
+                payload=BucketRestoreBackupVaultPayload, config=ProductActionConfig(
+        lock_subscription_on_failure=True
+    ))
+def bucket_restore_backup_vault():
+    @step
+    def validate_bucket(
+            payload: BucketRestoreBackupVaultPayload = depends(payload_dependency),
+            session: SASession = depends(sqlalchemy_session_dependency)
+    ) -> dict:
+        from cos_service.services.bucketService import get_bucket_by_sub_id
 
-    IBM COS: POST {cos_control_endpoint}/backup_vaults/{backup_vault_name}/restore
+        bucket = get_bucket_by_sub_id(session, payload.subscription_id)
+        if bucket is None or not bucket["name"]:
+            raise DeclineDemandException(
+                f"the bucket doesn't exist or not fully created for the sub id, {payload.subscription_id}")
+        if bucket["clean_status"] == Status.INPROGRESS.value:
+            raise DeclineDemandException(
+                "A clean bucket operation is already ongoing. Restore cannot be started meanwhile.")
+        if bucket.get("restore_status") == Status.INPROGRESS.value:
+            raise DeclineDemandException(
+                "A restore operation is already in progress for this bucket.")
 
-    restore_payload must contain:
-        - recovery_range_id: str
-        - restore_point_in_time: ISO-8601 timestamp (within the recovery range window)
-        - restore_type: "in_place"
-        - target_resource_crn: CRN of the destination bucket
-    """
-    url = f"{get_cos_control_endpoint()}/backup_vaults/{backup_vault_name}/restore"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+        return bucket
 
-    response = requests.post(url, headers=headers, json=restore_payload, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    return response.json()
+    @step
+    def get_cos_api_key(
+            bucket: dict,
+            vault: Vault = depends(vault_dependency)
+    ) -> str:
+        from cos_service.services.vault_service import get_cos_api_key
+
+        try:
+            return get_cos_api_key(bucket, vault)
+
+        except Exception as e:
+            raise e
+
+    @step
+    def get_latest_recovery_range(
+            api_key: str,
+            payload: BucketRestoreBackupVaultPayload = depends(payload_dependency),
+    ) -> dict:
+        from cos_service.services.ibm_iam_service import get_iam_access_token
+        from cos_service.services.backupVaultService import list_recovery_ranges
+
+        try:
+            access_token = get_iam_access_token(api_key)
+
+            recovery_ranges = list_recovery_ranges(payload.backup_vault_name, access_token)
+            if not recovery_ranges:
+                raise DeclineDemandException(
+                    f"No recovery range available on backup vault '{payload.backup_vault_name}'.")
+
+            latest_recovery_range = max(
+                recovery_ranges, key=lambda r: r["range_end_time"])
+
+            return latest_recovery_range
+        except DeclineDemandException:
+            raise
+        except Exception as e:
+            raise e
+
+    @step
+    def initiate_restore(
+            bucket: dict,
+            recovery_range: dict,
+            api_key: str,
+            payload: BucketRestoreBackupVaultPayload = depends(payload_dependency),
+    ) -> dict:
+        from cos_service.services.ibm_iam_service import get_iam_access_token
+        from cos_service.services.backupVaultService import start_restore_from_recovery_range
+
+        try:
+            access_token = get_iam_access_token(api_key)
+
+            restore_payload = {
+                "recovery_range_id": recovery_range["recovery_range_id"],
+                "restore_point_in_time": recovery_range["range_end_time"],
+                "restore_type": "in_place",
+                "target_resource_crn": bucket["crn"],
+            }
+
+            restore_job = start_restore_from_recovery_range(
+                payload.backup_vault_name, restore_payload, access_token)
+
+            return restore_job
+        except Exception as e:
+            raise e
+
+    @step
+    def save_restore_job_in_db(
+            restore_job: dict,
+            bucket: dict,
+            recovery_range: dict,
+            payload: BucketRestoreBackupVaultPayload = depends(payload_dependency),
+            state_manager: StateManager = depends(state_manager_dependency),
+            session: SASession = depends(sqlalchemy_session_dependency)
+    ) -> None:
+        from cos_service.services.backupVaultService import record_restore_job, get_restore_jobs_by_bucket_sub_id
+
+        try:
+
+            record_restore_job(bucket, payload.backup_vault_name,
+                               recovery_range["recovery_range_id"],
+                               restore_job["restore_id"],
+                               recovery_range["range_end_time"],
+                               payload.requester, session)
+            restore_jobs = get_restore_jobs_by_bucket_sub_id(bucket["subscription_id"], session)
+            restore_jobs_to_dict = [{"restore_job_id": job["restore_job_id"],
+                                     "backup_vault_name": job["backup_vault_name"],
+                                     "recovery_range_id": job["recovery_range_id"],
+                                     "restore_point_in_time": job["restore_point_in_time"],
+                                     "status": job["status"]}
+                                    for job in restore_jobs]
+            state_manager.push_state(
+                {"backup_vault_restore": {"jobs": restore_jobs_to_dict}, "restore_in_progress": True})
+
+        except Exception as e:
+            raise e
+
+    bucket = validate_bucket()
+    api_key = get_cos_api_key(bucket=bucket)
+    recovery_range = get_latest_recovery_range(api_key=api_key)
+    restore_job = initiate_restore(bucket=bucket, recovery_range=recovery_range, api_key=api_key)
+    save_restore_job_in_db(restore_job=restore_job, bucket=bucket, recovery_range=recovery_range)
+
+
+bucket_restore_backup_vault()
