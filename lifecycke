@@ -136,7 +136,7 @@ def bucket_restore_backup_vault():
 
         except Exception as e:
             raise e
-
+ 
     bucket = validate_bucket()
     api_key = get_cos_api_key(bucket=bucket)
     recovery_range = get_latest_recovery_range(api_key=api_key)
