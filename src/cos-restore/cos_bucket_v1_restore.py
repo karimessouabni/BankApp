@@ -60,8 +60,6 @@ def build_backup_vault_service() -> BackupVaultService:
 def read_restore_conf(dag_run_conf: dict[str, Any]) -> dict[str, str]:
     required_keys = {
         "backup_vault_name",
-        "recovery_range_id",
-        "restore_point_in_time",
         "source_resource_crn",
         "target_resource_crn",
     }
@@ -73,7 +71,12 @@ def read_restore_conf(dag_run_conf: dict[str, Any]) -> dict[str, str]:
             + ", ".join(missing_keys)
         )
 
-    return {key: str(dag_run_conf[key]) for key in required_keys}
+    restore_conf = {key: str(dag_run_conf[key]) for key in required_keys}
+
+    if dag_run_conf.get("restore_point_in_time"):
+        restore_conf["restore_point_in_time"] = str(dag_run_conf["restore_point_in_time"])
+
+    return restore_conf
 
 
 with DAG(
@@ -106,23 +109,28 @@ with DAG(
         except BackupVaultValidationError as exc:
             raise AirflowException(str(exc)) from exc
 
-        matching_range = next(
-            (
-                recovery_range
-                for recovery_range in recovery_ranges
-                if recovery_range.get("recovery_range_id")
-                == restore_conf["recovery_range_id"]
-            ),
-            None,
+        selected_recovery_range = service.select_latest_recovery_range(recovery_ranges)
+        recovery_range_id = selected_recovery_range.get("recovery_range_id")
+        restore_point_in_time = restore_conf.get(
+            "restore_point_in_time",
+            selected_recovery_range.get("range_end_time"),
         )
 
-        if matching_range is None:
+        if not recovery_range_id:
             raise AirflowException(
-                "Recovery range "
-                f"'{restore_conf['recovery_range_id']}' does not exist for "
+                "Latest recovery range does not expose a recovery_range_id for "
                 f"backup vault '{restore_conf['backup_vault_name']}' and "
                 f"source bucket '{restore_conf['source_resource_crn']}'."
             )
+
+        if not restore_point_in_time:
+            raise AirflowException(
+                "Latest recovery range does not expose range_end_time. "
+                "Pass restore_point_in_time explicitly in the DAG payload."
+            )
+
+        restore_conf["recovery_range_id"] = str(recovery_range_id)
+        restore_conf["restore_point_in_time"] = str(restore_point_in_time)
 
         active_restore = service.find_active_restore_for_target_bucket(
             backup_vault_name=restore_conf["backup_vault_name"],
@@ -139,7 +147,7 @@ with DAG(
                 return {
                     **restore_conf,
                     "backup_vault": backup_vault,
-                    "selected_recovery_range": matching_range,
+                    "selected_recovery_range": selected_recovery_range,
                     "existing_restore_id": active_restore["restore_id"],
                 }
 
@@ -154,7 +162,7 @@ with DAG(
         return {
             **restore_conf,
             "backup_vault": backup_vault,
-            "selected_recovery_range": matching_range,
+            "selected_recovery_range": selected_recovery_range,
         }
 
     @task(task_id=RESTORE_STATUS_TASK_ID)

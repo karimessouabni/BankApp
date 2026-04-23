@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -94,6 +95,15 @@ class BackupVaultService:
                 f"{bucket_context}."
             )
         return recovery_ranges
+
+    def select_latest_recovery_range(
+        self,
+        recovery_ranges: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not recovery_ranges:
+            raise BackupVaultValidationError("No recovery range available.")
+
+        return max(recovery_ranges, key=self._recovery_range_sort_key)
 
     def list_restores(self, backup_vault_name: str) -> list[dict[str, Any]]:
         self._validate_backup_vault_name(backup_vault_name)
@@ -271,3 +281,27 @@ class BackupVaultService:
                 "Must be 3-63 chars, lowercase alphanumeric with '.' or '-', "
                 "and cannot be IP-formatted."
             )
+
+    @staticmethod
+    def _recovery_range_sort_key(
+        recovery_range: dict[str, Any],
+    ) -> tuple[datetime, datetime, datetime]:
+        return (
+            BackupVaultService._parse_ibm_timestamp(recovery_range.get("range_end_time")),
+            BackupVaultService._parse_ibm_timestamp(recovery_range.get("range_create_time")),
+            BackupVaultService._parse_ibm_timestamp(recovery_range.get("range_start_time")),
+        )
+
+    @staticmethod
+    def _parse_ibm_timestamp(value: Any) -> datetime:
+        if not value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        normalized_value = str(value).replace("Z", "+00:00")
+        try:
+            parsed_value = datetime.fromisoformat(normalized_value)
+            if parsed_value.tzinfo is None:
+                return parsed_value.replace(tzinfo=timezone.utc)
+            return parsed_value
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
