@@ -4,8 +4,8 @@
 #
 # Usage:
 #   export IBM_API_KEY=...            # ou --apikey
-#   ./empty-bucket-script.sh --bucket bu002i007154 --dry-run
-#   ./empty-bucket-script.sh --bucket bu002i007154
+#   ./empty-bucket-script.sh --bucket bu002i007594 --dry-run
+#   ./empty-bucket-script.sh --bucket bu002i007594
 #
 # Note: les multipart uploads incomplets ne sont PAS des objets et ne sortent
 #       pas de ListObjects. Lancer multipart-cleaning.sh avant le delete du
@@ -19,7 +19,7 @@ COS_HOST="${COS_HOST:-s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud:443}
 BUCKET="${BUCKET:-}"
 API_KEY="${IBM_API_KEY:-}"
 DRY_RUN=0
-CURL_OPTS=(-sS -k)          # -k : chaîne TLS interne BNP
+CURL_OPTS=(-sS -k)          # -k : chaine TLS interne BNP
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +37,10 @@ done
 
 ENDPOINT="https://${COS_HOST}/${BUCKET}"
 
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+BODY_FILE="$WORKDIR/body"
+
 # ------------------------------------------------------------------ IAM -----
 TOKEN=""
 TOKEN_EXP=0
@@ -49,14 +53,14 @@ refresh_token() {
       --data-urlencode "apikey=${API_KEY}" \
       --data-urlencode 'response_type=cloud_iam' \
       --data-urlencode 'grant_type=urn:ibm:params:oauth:grant-type:apikey') \
-    || { echo "ERREUR: appel IAM échoué" >&2; exit 1; }
+    || { echo "ERREUR: appel IAM echoue" >&2; exit 1; }
 
   TOKEN=$(printf '%s' "$json" | python3 -c \
     'import sys,json; print(json.load(sys.stdin).get("access_token",""))') || true
 
   if [[ -z "$TOKEN" ]]; then
-    echo "ERREUR: pas d'access_token dans la réponse IAM :" >&2
-    printf '%s\n' "$json" | head -c 400 >&2; echo >&2
+    echo "ERREUR: pas d'access_token dans la reponse IAM :" >&2
+    printf '%s\n' "${json:0:400}" >&2
     exit 1
   fi
 
@@ -64,78 +68,76 @@ refresh_token() {
   ttl=$(printf '%s' "$json" | python3 -c \
     'import sys,json; print(json.load(sys.stdin).get("expires_in",3600))')
   TOKEN_EXP=$(( $(date +%s) + ttl - 300 ))   # marge de 5 min
-  echo "Token IAM obtenu (valide ~$(( ttl / 60 )) min)."
+  echo "Token IAM obtenu (valide ~$(( ttl / 60 )) min)." >&2
 }
 
-ensure_token() {
-  (( $(date +%s) < TOKEN_EXP )) || refresh_token
-}
+ensure_token() { (( $(date +%s) < TOKEN_EXP )) || refresh_token; }
 
 # ---------------------------------------------------------------- helpers ---
+# IMPORTANT: cos() s'appelle SANS $( ), sinon TOKEN et HTTP_CODE sont perdus
+# dans le sous-shell. Le corps de la reponse atterrit dans $BODY_FILE.
 HTTP_CODE=""
 cos() {
   local method="$1" path="$2"; shift 2
   ensure_token
-  local out
-  out=$(curl "${CURL_OPTS[@]}" -w '\n%{http_code}' -X "$method" \
-        --url "${ENDPOINT}${path}" \
-        -H "Authorization: Bearer ${TOKEN}" "$@") \
-    || { echo "ERREUR: curl a échoué (réseau/proxy) sur ${method} ${path}" >&2; return 1; }
-  HTTP_CODE="${out##*$'\n'}"
-  printf '%s' "${out%$'\n'*}"
+  HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o "$BODY_FILE" -w '%{http_code}' \
+      -X "$method" --url "${ENDPOINT}${path}" \
+      -H "Authorization: Bearer ${TOKEN}" "$@") \
+    || { echo "ERREUR: curl a echoue (reseau/proxy) sur ${method} ${path}" >&2; return 1; }
 }
 
 urlencode_key() {
-  # garde les "/" ; python3 gère l'UTF-8 là où printf de bash foire >127
   python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe='/'))" "$1"
 }
 
-xp() { xmllint --xpath "$1" - 2>/dev/null || true; }
+xp() { xmllint --xpath "$1" "$BODY_FILE" 2>/dev/null || true; }
 
 # ------------------------------------------------------------------ main ----
 echo "Bucket   : $BUCKET"
 echo "Endpoint : $ENDPOINT"
-(( DRY_RUN )) && echo "Mode     : DRY-RUN (aucune suppression réelle)"
+(( DRY_RUN )) && echo "Mode     : DRY-RUN (aucune suppression reelle)"
 echo
 
+ensure_token
+
 MARKER=""
-TOTAL=0
-DELETED=0
-FAILED=0
-PAGE=0
+TOTAL=0; DELETED=0; FAILED=0; PAGE=0
 
 while :; do
   PAGE=$(( PAGE + 1 ))
   QUERY="?max-keys=1000"
   [[ -n "$MARKER" ]] && QUERY+="&marker=$(urlencode_key "$MARKER")"
 
-  XML=$(cos GET "$QUERY")
+  cos GET "$QUERY" || exit 1
   if [[ "$HTTP_CODE" != "200" ]]; then
-    echo "ERREUR: ListObjects a renvoyé HTTP $HTTP_CODE" >&2
-    printf '%s\n' "$XML" | head -c 600 >&2; echo >&2
+    echo "ERREUR: ListObjects a renvoye HTTP $HTTP_CODE" >&2
+    head -c 600 "$BODY_FILE" >&2; echo >&2
     exit 1
   fi
 
-  COUNT=$(printf '%s' "$XML" | xp 'count(//*[local-name()="Contents"])')
-  COUNT="${COUNT:-0}"
-  echo "Page $PAGE : $COUNT objet(s)."
+  COUNT=$(xp 'count(//*[local-name()="Contents"])'); COUNT="${COUNT:-0}"
+  TRUNCATED=$(xp 'string(//*[local-name()="IsTruncated"]/text())')
+  NEXT_MARKER=$(xp 'string(//*[local-name()="NextMarker"]/text())')
 
-  if (( COUNT == 0 )); then
-    (( PAGE == 1 )) && echo "Bucket déjà vide."
+  # on fige la page courante : BODY_FILE sera ecrase par les DELETE
+  cp "$BODY_FILE" "$WORKDIR/page.xml"
+  KEYS=()
+  for (( i=1; i<=COUNT; i++ )); do
+    K=$(xmllint --xpath \
+      "string((//*[local-name()='Contents'])[$i]/*[local-name()='Key']/text())" \
+      "$WORKDIR/page.xml" 2>/dev/null || true)
+    [[ -n "$K" ]] && KEYS+=("$K")
+  done
+
+  echo "Page $PAGE : ${#KEYS[@]} objet(s)."
+  if (( ${#KEYS[@]} == 0 )); then
+    (( PAGE == 1 )) && echo "Bucket deja vide."
     break
   fi
 
-  LAST_KEY=""
-  for (( i=1; i<=COUNT; i++ )); do
-    KEY=$(printf '%s' "$XML" | xp "string((//*[local-name()='Contents'])[$i]/*[local-name()='Key']/text())")
+  LAST_KEY="${KEYS[-1]}"
 
-    if [[ -z "$KEY" ]]; then
-      echo "  /!\\ Objet #$i ignoré (key vide)"
-      FAILED=$(( FAILED + 1 ))
-      continue
-    fi
-    LAST_KEY="$KEY"
-
+  for KEY in "${KEYS[@]}"; do
     TOTAL=$(( TOTAL + 1 ))
     ENCODED_KEY=$(urlencode_key "$KEY")
     echo "  [$TOTAL] $KEY"
@@ -145,33 +147,28 @@ while :; do
       continue
     fi
 
-    BODY=$(cos DELETE "/${ENCODED_KEY}") || { FAILED=$(( FAILED + 1 )); continue; }
+    if ! cos DELETE "/${ENCODED_KEY}"; then
+      FAILED=$(( FAILED + 1 )); continue
+    fi
     if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
       echo "        -> HTTP $HTTP_CODE OK"
       DELETED=$(( DELETED + 1 ))
     else
       echo "        -> HTTP $HTTP_CODE ECHEC"
-      [[ -n "$BODY" ]] && printf '           %s\n' "$(printf '%s' "$BODY" | head -c 300)"
+      head -c 300 "$BODY_FILE"; echo
       FAILED=$(( FAILED + 1 ))
     fi
   done
 
-  TRUNCATED=$(printf '%s' "$XML" | xp 'string(//*[local-name()="IsTruncated"]/text())')
-  if [[ "$TRUNCATED" == "true" ]]; then
-    if (( DRY_RUN )); then
-      # rien n'est supprimé : on avance avec le marker
-      NEXT=$(printf '%s' "$XML" | xp 'string(//*[local-name()="NextMarker"]/text())')
-      MARKER="${NEXT:-$LAST_KEY}"
-      [[ -n "$MARKER" ]] || break
-    else
-      # les objets ont été supprimés : on repart du début du bucket
-      MARKER=""
-    fi
+  [[ "$TRUNCATED" == "true" ]] || break
+  if (( DRY_RUN )); then
+    MARKER="${NEXT_MARKER:-$LAST_KEY}"
+    [[ -n "$MARKER" ]] || break
   else
-    break
+    MARKER=""    # objets supprimes : on relit depuis le debut
   fi
 done
 
 echo
-echo "Résumé : $TOTAL trouvé(s), $DELETED supprimé(s), $FAILED en échec."
+echo "Resume : $TOTAL trouve(s), $DELETED supprime(s), $FAILED en echec."
 (( FAILED == 0 ))
