@@ -135,9 +135,10 @@ while :; do
     break
   fi
 
-  LAST_KEY="${KEYS[-1]}"
+  LAST_KEY="${KEYS[$(( ${#KEYS[@]} - 1 ))]}"
 
-  for KEY in "${KEYS[@]}"; do
+  for (( j=0; j<${#KEYS[@]}; j++ )); do
+    KEY="${KEYS[$j]}"
     TOTAL=$(( TOTAL + 1 ))
     ENCODED_KEY=$(urlencode_key "$KEY")
     echo "  [$TOTAL] $KEY"
