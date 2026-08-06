@@ -1,28 +1,165 @@
 #!/usr/bin/env bash
+#
+# Abort des multipart uploads incomplets sur un bucket IBM COS.
+#
+# Usage:
+#   export IBM_API_KEY=...            # ou --apikey
+#   ./multipart-cleaning.sh --bucket bu002i009999
+#   ./multipart-cleaning.sh --bucket bu002i009999 --dry-run
+#
 set -euo pipefail
 
-: "${IBM_API_KEY:?IBM_API_KEY non défini}"
-BUCKET="${BUCKET:-bu002i009999}"
+# ---------------------------------------------------------------- config ----
+IAM_URL="${IAM_URL:-https://private.iam.cloud.ibm.com/identity/token}"
+COS_HOST="${COS_HOST:-s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud:443}"
+BUCKET="${BUCKET:-}"
+API_KEY="${IBM_API_KEY:-}"
+DRY_RUN=0
+CURL_OPTS=(-sS -k)          # -k : chaîne TLS interne BNP
 
-IAM_URL="https://private.iam.cloud.ibm.com/identity/token"
-ENDPOINT="https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud:443/${BUCKET}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bucket)  BUCKET="$2"; shift 2 ;;
+    --apikey)  API_KEY="$2"; shift 2 ;;
+    --host)    COS_HOST="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "Option inconnue : $1" >&2; exit 2 ;;
+  esac
+done
 
-get_token() {
-  curl -sS -k -X POST "$IAM_URL" \
-    -H 'Accept: application/json' \
-    -H 'Content-Type: application/x-www-form-urlencoded' \
-    --data-urlencode "apikey=${IBM_API_KEY}" \
-    --data-urlencode 'response_type=cloud_iam' \
-    --data-urlencode 'grant_type=urn:ibm:params:oauth:grant-type:apikey' \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])'
+[[ -n "$BUCKET"  ]] || { echo "ERREUR: --bucket ou \$BUCKET requis" >&2; exit 2; }
+[[ -n "$API_KEY" ]] || { echo "ERREUR: --apikey ou \$IBM_API_KEY requis" >&2; exit 2; }
+
+ENDPOINT="https://${COS_HOST}/${BUCKET}"
+
+# ------------------------------------------------------------------ IAM -----
+TOKEN=""
+TOKEN_EXP=0
+
+refresh_token() {
+  local json
+  json=$(curl "${CURL_OPTS[@]}" -X POST "$IAM_URL" \
+      -H 'Accept: application/json' \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --data-urlencode "apikey=${API_KEY}" \
+      --data-urlencode 'response_type=cloud_iam' \
+      --data-urlencode 'grant_type=urn:ibm:params:oauth:grant-type:apikey') \
+    || { echo "ERREUR: appel IAM échoué" >&2; exit 1; }
+
+  TOKEN=$(printf '%s' "$json" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin); print(d.get("access_token",""))') || true
+
+  if [[ -z "$TOKEN" ]]; then
+    echo "ERREUR: pas d'access_token dans la réponse IAM :" >&2
+    printf '%s\n' "$json" | head -c 400 >&2; echo >&2
+    exit 1
+  fi
+
+  local ttl
+  ttl=$(printf '%s' "$json" | python3 -c \
+    'import sys,json; print(json.load(sys.stdin).get("expires_in",3600))')
+  TOKEN_EXP=$(( $(date +%s) + ttl - 300 ))   # marge de 5 min
+  echo "Token IAM obtenu (valide ~$(( ttl / 60 )) min)."
 }
 
-TOKEN="$(get_token)" || { echo "Échec IAM" >&2; exit 1; }
-[[ -n "$TOKEN" ]] || { echo "Token vide" >&2; exit 1; }
+ensure_token() {
+  (( $(date +%s) < TOKEN_EXP )) || refresh_token
+}
 
-# wrapper : cos <METHOD> <path/query> [args curl...]
+# ---------------------------------------------------------------- helpers ---
+# cos <METHOD> <path+query> [curl args...] -> body sur stdout, code HTTP en var
+HTTP_CODE=""
 cos() {
   local method="$1" path="$2"; shift 2
-  curl -sS -k -X "$method" "${ENDPOINT}${path}" \
-    -H "Authorization: Bearer ${TOKEN}" "$@"
+  ensure_token
+  local out code
+  out=$(curl "${CURL_OPTS[@]}" -w '\n%{http_code}' -X "$method" \
+        --url "${ENDPOINT}${path}" \
+        -H "Authorization: Bearer ${TOKEN}" "$@") \
+    || { echo "ERREUR: curl a échoué (réseau/proxy) sur ${method} ${path}" >&2; return 1; }
+  code="${out##*$'\n'}"
+  HTTP_CODE="$code"
+  printf '%s' "${out%$'\n'*}"
 }
+
+urlencode_key() {
+  # garde les "/" ; python3 gère l'UTF-8 là où printf de bash foire >127
+  python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe='/'))" "$1"
+}
+
+xp() {  # xp <xpath> <<< xml
+  xmllint --xpath "$1" - 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ main ----
+echo "Bucket   : $BUCKET"
+echo "Endpoint : $ENDPOINT"
+(( DRY_RUN )) && echo "Mode     : DRY-RUN (aucun abort réel)"
+echo
+
+KEY_MARKER=""
+UPLOAD_ID_MARKER=""
+TOTAL=0
+ABORTED=0
+FAILED=0
+PAGE=0
+
+while :; do
+  PAGE=$(( PAGE + 1 ))
+  QUERY="?uploads&max-uploads=1000"
+  [[ -n "$KEY_MARKER"       ]] && QUERY+="&key-marker=$(urlencode_key "$KEY_MARKER")"
+  [[ -n "$UPLOAD_ID_MARKER" ]] && QUERY+="&upload-id-marker=${UPLOAD_ID_MARKER}"
+
+  XML=$(cos GET "$QUERY")
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    echo "ERREUR: ListMultipartUploads a renvoyé HTTP $HTTP_CODE" >&2
+    printf '%s\n' "$XML" | head -c 600 >&2; echo >&2
+    exit 1
+  fi
+
+  COUNT=$(printf '%s' "$XML" | xp 'count(//*[local-name()="Upload"])')
+  COUNT="${COUNT:-0}"
+  echo "Page $PAGE : $COUNT upload(s) incomplet(s)."
+
+  for (( i=1; i<=COUNT; i++ )); do
+    KEY=$(printf '%s' "$XML" | xp "string((//*[local-name()='Upload'])[$i]/*[local-name()='Key']/text())")
+    UPLOAD_ID=$(printf '%s' "$XML" | xp "string((//*[local-name()='Upload'])[$i]/*[local-name()='UploadId']/text())")
+
+    if [[ -z "$KEY" || -z "$UPLOAD_ID" ]]; then
+      echo "  /!\\ Upload #$i ignoré (key ou uploadId vide)"
+      FAILED=$(( FAILED + 1 ))
+      continue
+    fi
+
+    TOTAL=$(( TOTAL + 1 ))
+    ENCODED_KEY=$(urlencode_key "$KEY")
+    echo "  [$TOTAL] $KEY"
+    echo "        uploadId=$UPLOAD_ID"
+
+    if (( DRY_RUN )); then
+      echo "        (dry-run) DELETE ${ENDPOINT}/${ENCODED_KEY}?uploadId=${UPLOAD_ID}"
+      continue
+    fi
+
+    BODY=$(cos DELETE "/${ENCODED_KEY}?uploadId=${UPLOAD_ID}") || { FAILED=$(( FAILED + 1 )); continue; }
+    if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+      echo "        -> HTTP $HTTP_CODE OK"
+      ABORTED=$(( ABORTED + 1 ))
+    else
+      echo "        -> HTTP $HTTP_CODE ECHEC"
+      [[ -n "$BODY" ]] && printf '           %s\n' "$(printf '%s' "$BODY" | head -c 300)"
+      FAILED=$(( FAILED + 1 ))
+    fi
+  done
+
+  TRUNCATED=$(printf '%s' "$XML" | xp 'string(//*[local-name()="IsTruncated"]/text())')
+  [[ "$TRUNCATED" == "true" ]] || break
+  KEY_MARKER=$(printf '%s' "$XML"       | xp 'string(//*[local-name()="NextKeyMarker"]/text())')
+  UPLOAD_ID_MARKER=$(printf '%s' "$XML" | xp 'string(//*[local-name()="NextUploadIdMarker"]/text())')
+  [[ -n "$KEY_MARKER" || -n "$UPLOAD_ID_MARKER" ]] || break
+done
+
+echo
+echo "Résumé : $TOTAL trouvé(s), $ABORTED aborté(s), $FAILED en échec."
+(( FAILED == 0 ))
