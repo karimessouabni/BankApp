@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-#
+#export IBM_API_KEY=$(security find-generic-password -s ibm-cos-apikey -w)
+./multipart-cleaning.sh --bucket bu002i009999 --dry-run
+
 # Abort des multipart uploads incomplets sur un bucket IBM COS.
 #
 # Usage:
