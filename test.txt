@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 #
-# Vide un bucket IBM COS (suppression de tous les objets).
+# Abort des multipart uploads incomplets sur un bucket IBM COS.
 #
 # Usage:
 #   export IBM_API_KEY=...            # ou --apikey
-#   ./empty-bucket-script.sh --bucket bu002i007594 --dry-run
-#   ./empty-bucket-script.sh --bucket bu002i007594
-#
-# Note: les multipart uploads incomplets ne sont PAS des objets et ne sortent
-#       pas de ListObjects. Lancer multipart-cleaning.sh avant le delete du
-#       bucket, sinon il repart en 409.
+#   ./multipart-cleaning.sh --bucket bu002i007594 --dry-run
+#   ./multipart-cleaning.sh --bucket bu002i007594
+#   # ou avec un token deja obtenu (bypass IAM) :
+#   ./multipart-cleaning.sh --bucket bu002i007594 --token "$token"
 #
 set -euo pipefail
 
@@ -18,6 +16,7 @@ IAM_URL="${IAM_URL:-https://private.iam.cloud.ibm.com/identity/token}"
 COS_HOST="${COS_HOST:-s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud:443}"
 BUCKET="${BUCKET:-}"
 API_KEY="${IBM_API_KEY:-}"
+TOKEN="${COS_TOKEN:-}"
 DRY_RUN=0
 CURL_OPTS=(-sS -k)          # -k : chaine TLS interne BNP
 
@@ -25,15 +24,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --bucket)  BUCKET="$2"; shift 2 ;;
     --apikey)  API_KEY="$2"; shift 2 ;;
+    --token)   TOKEN="$2"; shift 2 ;;
     --host)    COS_HOST="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) echo "Option inconnue : $1" >&2; exit 2 ;;
   esac
 done
 
-[[ -n "$BUCKET"  ]] || { echo "ERREUR: --bucket ou \$BUCKET requis" >&2; exit 2; }
-[[ -n "$API_KEY" ]] || { echo "ERREUR: --apikey ou \$IBM_API_KEY requis" >&2; exit 2; }
+[[ -n "$BUCKET" ]] || { echo "ERREUR: --bucket ou \$BUCKET requis" >&2; exit 2; }
+if [[ -z "$API_KEY" && -z "$TOKEN" ]]; then
+  echo "ERREUR: --apikey (\$IBM_API_KEY) ou --token (\$COS_TOKEN) requis" >&2; exit 2
+fi
 
 ENDPOINT="https://${COS_HOST}/${BUCKET}"
 
@@ -42,10 +44,14 @@ trap 'rm -rf "$WORKDIR"' EXIT
 BODY_FILE="$WORKDIR/body"
 
 # ------------------------------------------------------------------ IAM -----
-TOKEN=""
 TOKEN_EXP=0
+# Token fourni directement : pas de refresh possible, on le considere valide 50 min
+[[ -n "$TOKEN" ]] && TOKEN_EXP=$(( $(date +%s) + 3000 ))
 
 refresh_token() {
+  if [[ -z "$API_KEY" ]]; then
+    echo "ERREUR: token expire et pas d'API key pour le renouveler" >&2; exit 1
+  fi
   local json
   json=$(curl "${CURL_OPTS[@]}" -X POST "$IAM_URL" \
       -H 'Accept: application/json' \
@@ -53,7 +59,7 @@ refresh_token() {
       --data-urlencode "apikey=${API_KEY}" \
       --data-urlencode 'response_type=cloud_iam' \
       --data-urlencode 'grant_type=urn:ibm:params:oauth:grant-type:apikey') \
-    || { echo "ERREUR: appel IAM echoue" >&2; exit 1; }
+    || { echo "ERREUR: appel IAM echoue (URL: $IAM_URL) — verifier proxy/reseau" >&2; exit 1; }
 
   TOKEN=$(printf '%s' "$json" | python3 -c \
     'import sys,json; print(json.load(sys.stdin).get("access_token",""))') || true
@@ -67,7 +73,7 @@ refresh_token() {
   local ttl
   ttl=$(printf '%s' "$json" | python3 -c \
     'import sys,json; print(json.load(sys.stdin).get("expires_in",3600))')
-  TOKEN_EXP=$(( $(date +%s) + ttl - 300 ))   # marge de 5 min
+  TOKEN_EXP=$(( $(date +%s) + ttl - 300 ))
   echo "Token IAM obtenu (valide ~$(( ttl / 60 )) min)." >&2
 }
 
@@ -92,68 +98,80 @@ urlencode_key() {
 
 xp() { xmllint --xpath "$1" "$BODY_FILE" 2>/dev/null || true; }
 
+# ------------------------------------------------------------- prerequis ----
+for bin in curl python3 xmllint; do
+  command -v "$bin" >/dev/null || { echo "ERREUR: '$bin' introuvable dans le PATH" >&2; exit 3; }
+done
+
 # ------------------------------------------------------------------ main ----
 echo "Bucket   : $BUCKET"
 echo "Endpoint : $ENDPOINT"
-(( DRY_RUN )) && echo "Mode     : DRY-RUN (aucune suppression reelle)"
+(( DRY_RUN )) && echo "Mode     : DRY-RUN (aucun abort reel)"
 echo
 
 ensure_token
 
-MARKER=""
-TOTAL=0; DELETED=0; FAILED=0; PAGE=0
+KEY_MARKER=""; UPLOAD_ID_MARKER=""
+TOTAL=0; ABORTED=0; FAILED=0; PAGE=0
 
 while :; do
   PAGE=$(( PAGE + 1 ))
-  QUERY="?max-keys=1000"
-  [[ -n "$MARKER" ]] && QUERY+="&marker=$(urlencode_key "$MARKER")"
+  QUERY="?uploads&max-uploads=1000"
+  [[ -n "$KEY_MARKER"       ]] && QUERY+="&key-marker=$(urlencode_key "$KEY_MARKER")"
+  [[ -n "$UPLOAD_ID_MARKER" ]] && QUERY+="&upload-id-marker=${UPLOAD_ID_MARKER}"
 
   cos GET "$QUERY" || exit 1
   if [[ "$HTTP_CODE" != "200" ]]; then
-    echo "ERREUR: ListObjects a renvoye HTTP $HTTP_CODE" >&2
+    echo "ERREUR: ListMultipartUploads a renvoye HTTP $HTTP_CODE" >&2
     head -c 600 "$BODY_FILE" >&2; echo >&2
     exit 1
   fi
 
-  COUNT=$(xp 'count(//*[local-name()="Contents"])'); COUNT="${COUNT:-0}"
+  COUNT=$(xp 'count(//*[local-name()="Upload"])'); COUNT="${COUNT:-0}"
   TRUNCATED=$(xp 'string(//*[local-name()="IsTruncated"]/text())')
-  NEXT_MARKER=$(xp 'string(//*[local-name()="NextMarker"]/text())')
+  NEXT_KEY=$(xp 'string(//*[local-name()="NextKeyMarker"]/text())')
+  NEXT_UID=$(xp 'string(//*[local-name()="NextUploadIdMarker"]/text())')
 
-  # on fige la page courante : BODY_FILE sera ecrase par les DELETE
   cp "$BODY_FILE" "$WORKDIR/page.xml"
-  KEYS=()
+  KEYS=(); UIDS=()
   for (( i=1; i<=COUNT; i++ )); do
     K=$(xmllint --xpath \
-      "string((//*[local-name()='Contents'])[$i]/*[local-name()='Key']/text())" \
+      "string((//*[local-name()='Upload'])[$i]/*[local-name()='Key']/text())" \
       "$WORKDIR/page.xml" 2>/dev/null || true)
-    [[ -n "$K" ]] && KEYS+=("$K")
+    U=$(xmllint --xpath \
+      "string((//*[local-name()='Upload'])[$i]/*[local-name()='UploadId']/text())" \
+      "$WORKDIR/page.xml" 2>/dev/null || true)
+    if [[ -z "$K" || -z "$U" ]]; then
+      echo "  /!\\ Upload #$i ignore (key ou uploadId vide)"
+      FAILED=$(( FAILED + 1 )); continue
+    fi
+    KEYS+=("$K"); UIDS+=("$U")
   done
 
-  echo "Page $PAGE : ${#KEYS[@]} objet(s)."
+  echo "Page $PAGE : ${#KEYS[@]} upload(s) incomplet(s)."
   if (( ${#KEYS[@]} == 0 )); then
-    (( PAGE == 1 )) && echo "Bucket deja vide."
+    (( PAGE == 1 )) && echo "Aucun multipart upload incomplet."
     break
   fi
 
-  LAST_KEY="${KEYS[$(( ${#KEYS[@]} - 1 ))]}"
-
   for (( j=0; j<${#KEYS[@]}; j++ )); do
-    KEY="${KEYS[$j]}"
+    KEY="${KEYS[$j]}"; UPLOAD_ID="${UIDS[$j]}"
     TOTAL=$(( TOTAL + 1 ))
     ENCODED_KEY=$(urlencode_key "$KEY")
     echo "  [$TOTAL] $KEY"
+    echo "        uploadId=$UPLOAD_ID"
 
     if (( DRY_RUN )); then
-      echo "        (dry-run) DELETE ${ENDPOINT}/${ENCODED_KEY}"
+      echo "        (dry-run) DELETE ${ENDPOINT}/${ENCODED_KEY}?uploadId=${UPLOAD_ID}"
       continue
     fi
 
-    if ! cos DELETE "/${ENCODED_KEY}"; then
+    if ! cos DELETE "/${ENCODED_KEY}?uploadId=${UPLOAD_ID}"; then
       FAILED=$(( FAILED + 1 )); continue
     fi
     if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
       echo "        -> HTTP $HTTP_CODE OK"
-      DELETED=$(( DELETED + 1 ))
+      ABORTED=$(( ABORTED + 1 ))
     else
       echo "        -> HTTP $HTTP_CODE ECHEC"
       head -c 300 "$BODY_FILE"; echo
@@ -163,13 +181,13 @@ while :; do
 
   [[ "$TRUNCATED" == "true" ]] || break
   if (( DRY_RUN )); then
-    MARKER="${NEXT_MARKER:-$LAST_KEY}"
-    [[ -n "$MARKER" ]] || break
+    KEY_MARKER="$NEXT_KEY"; UPLOAD_ID_MARKER="$NEXT_UID"
+    [[ -n "$KEY_MARKER" || -n "$UPLOAD_ID_MARKER" ]] || break
   else
-    MARKER=""    # objets supprimes : on relit depuis le debut
+    KEY_MARKER=""; UPLOAD_ID_MARKER=""
   fi
 done
 
 echo
-echo "Resume : $TOTAL trouve(s), $DELETED supprime(s), $FAILED en echec."
+echo "Resume : $TOTAL trouve(s), $ABORTED aborte(s), $FAILED en echec."
 (( FAILED == 0 ))
