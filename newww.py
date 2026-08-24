@@ -43,3 +43,67 @@ def compute_bucket_object_lock(
 
     logging.info(f"compute_bucket_object_lock3 {immutability}")
     return immutability
+
+
+_RETENTION_KEYS = ("default", "minimum", "maximum")
+
+
+def compute_retention_total_days(days, years):
+    """Total de jours pour un attribut de rétention, ou None si rien n'est saisi."""
+    if days is None and years is None:
+        return None
+    return compute_total_object_lock_days(days, years)
+
+
+def compute_bucket_retention(retention: BucketRetention, immutability: dict, operation: str) -> dict:
+    errors = []
+
+    totals = {
+        key: compute_retention_total_days(
+            getattr(retention, f"{key}_days"),
+            getattr(retention, f"{key}_years"),
+        )
+        for key in _RETENTION_KEYS
+    }
+    default, minimum, maximum = totals["default"], totals["minimum"], totals["maximum"]
+
+    if default is None or minimum is None or maximum is None:
+        logging.info("compute_bucket_retention1")
+        raise DeclineDemandException(
+            "Retention configuration is not valid. You must set all attributes "
+            "(<attribute>_days and/or <attribute>_years) to update the existing bucket retention."
+        )
+
+    if minimum <= 0 or minimum > default:
+        logging.info("compute_bucket_retention2")
+        errors.append(
+            f"Retention minimum ({minimum} days) cannot be inferior or equal to 0 "
+            f"nor superior to default ({default} days)."
+        )
+
+    if default < minimum or default >= maximum:
+        logging.info("compute_bucket_retention3")
+        errors.append(
+            f"Retention default ({default} days) cannot be inferior to minimum ({minimum} days) "
+            f"nor superior or equal to maximum ({maximum} days)."
+        )
+
+    if maximum > MAX_RETENTION_DAYS or maximum <= default:
+        logging.info("compute_bucket_retention4")
+        errors.append(
+            f"Retention maximum ({maximum} days) cannot be inferior or equal to default "
+            f"({default} days) nor superior to 5 years ({MAX_RETENTION_DAYS} days)."
+        )
+
+    if errors:
+        global_message = " | ".join(errors)
+        raise DeclineDemandException(global_message)
+
+    # Les trois attributs sont normalisés en jours, comme object_lock_duration_days.
+    immutability["retention"]["retention_enabled"] = retention.retention_enabled
+    for key in _RETENTION_KEYS:
+        immutability["retention"][f"{key}_days"] = totals[key]
+        immutability["retention"][f"{key}_years"] = None
+
+    logging.info(f"compute_bucket_retention5 {immutability} for operation {operation}")
+    return immutability
