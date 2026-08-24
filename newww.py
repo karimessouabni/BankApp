@@ -107,3 +107,83 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict, ope
 
     logging.info(f"compute_bucket_retention5 {immutability} for operation {operation}")
     return immutability
+
+
+def validate_immutability(retention, backup, bucket: dict, existing_immutability: dict) -> dict:
+    errors = []
+
+    if backup and not backup.is_empty() and backup.backup_enabled:
+        errors.append(
+            "Retention and bucket backup are not compatible. "
+            "We cannot activate backup when retention is enabled."
+        )
+
+    if not retention or retention.is_empty() or not retention.retention_enabled:
+        logging.info("validate_immutability9")
+        existing_retention = existing_immutability["retention"]
+        totals = {
+            key: compute_retention_total_days(
+                existing_retention.get(f"{key}_days"),
+                existing_retention.get(f"{key}_years"),
+            )
+            for key in _RETENTION_KEYS
+        }
+    else:
+        totals = {
+            key: compute_retention_total_days(
+                getattr(retention, f"{key}_days"),
+                getattr(retention, f"{key}_years"),
+            )
+            for key in _RETENTION_KEYS
+        }
+        # attribut non resaisi : on garde la valeur déjà en base (en jours)
+        for key in _RETENTION_KEYS:
+            if totals[key] is None:
+                totals[key] = bucket[f"retention_{key}"]
+
+    default, minimum, maximum = totals["default"], totals["minimum"], totals["maximum"]
+
+    if default is None or minimum is None or maximum is None:
+        logging.info("validate_immutability9b")
+        errors.append(
+            "Retention configuration is not valid. You must set default, minimum and maximum "
+            "(<attribute>_days and/or <attribute>_years)."
+        )
+    else:
+        if minimum <= 0 or minimum > default:
+            logging.info("validate_immutability10")
+            errors.append(
+                f"Retention minimum ({minimum} days) cannot be inferior or equal to 0 "
+                f"nor superior to default ({default} days)."
+            )
+
+        if default < minimum or default >= maximum:
+            logging.info("validate_immutability11")
+            errors.append(
+                f"Retention default ({default} days) cannot be inferior to minimum ({minimum} days) "
+                f"nor superior or equal to maximum ({maximum} days)."
+            )
+
+        if maximum > MAX_RETENTION_DAYS or maximum <= default:
+            logging.info("validate_immutability12")
+            errors.append(
+                f"Retention maximum ({maximum} days) cannot be inferior or equal to default "
+                f"({default} days) nor superior to 5 years ({MAX_RETENTION_DAYS} days)."
+            )
+
+        existing_immutability["retention"] = {
+            "retention_enabled": True,
+            "default_days": default,
+            "default_years": None,
+            "minimum_days": minimum,
+            "minimum_years": None,
+            "maximum_days": maximum,
+            "maximum_years": None,
+        }
+        logging.info(f"validate_immutability13 : {existing_immutability}")
+
+    if errors:
+        global_message = " | ".join(errors)
+        raise DeclineDemandException(global_message)
+
+    return existing_immutability
