@@ -24,6 +24,14 @@ class BucketRetention(BaseModel):
             return years * DAYS_PER_YEAR
         return None
 
+    @staticmethod
+    def _to_years(days: int | None, years: int | None) -> float | None:
+        if years is not None:
+            return float(years)
+        if days is not None:
+            return days / DAYS_PER_YEAR
+        return None
+
     # ── 1. Auto-enable si un paramètre est fourni sans le flag ───────────
     @root_validator(pre=True)
     def _auto_enable_retention(cls, values: dict) -> dict:
@@ -80,6 +88,31 @@ class BucketRetention(BaseModel):
     @property
     def maximum(self) -> int | None:
         return self._to_days(self.maximum_days, self.maximum_years)
+
+    # ── Lecture dans les deux unités pour chacun des trois attributs ────
+    @property
+    def default_in_days(self) -> int | None:
+        return self._to_days(self.default_days, self.default_years)
+
+    @property
+    def default_in_years(self) -> float | None:
+        return self._to_years(self.default_days, self.default_years)
+
+    @property
+    def minimum_in_days(self) -> int | None:
+        return self._to_days(self.minimum_days, self.minimum_years)
+
+    @property
+    def minimum_in_years(self) -> float | None:
+        return self._to_years(self.minimum_days, self.minimum_years)
+
+    @property
+    def maximum_in_days(self) -> int | None:
+        return self._to_days(self.maximum_days, self.maximum_years)
+
+    @property
+    def maximum_in_years(self) -> float | None:
+        return self._to_years(self.maximum_days, self.maximum_years)
 
     def __iter__(self):
         yield "default", self.default
