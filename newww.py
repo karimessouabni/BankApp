@@ -120,14 +120,10 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
 
     if not retention or retention.is_empty() or not retention.retention_enabled:
         logging.info("validate_immutability9")
+        # existing_immutability ne porte pas de jours/années : ses trois attributs
+        # viennent des colonnes retention_* du bucket, déjà exprimées en jours.
         existing_retention = existing_immutability["retention"]
-        totals = {
-            key: compute_retention_total_days(
-                existing_retention.get(f"{key}_days"),
-                existing_retention.get(f"{key}_years"),
-            )
-            for key in _RETENTION_KEYS
-        }
+        totals = {key: existing_retention[key] for key in _RETENTION_KEYS}
     else:
         totals = {
             key: compute_retention_total_days(
@@ -146,8 +142,8 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
     if default is None or minimum is None or maximum is None:
         logging.info("validate_immutability9b")
         errors.append(
-            "Retention configuration is not valid. You must set default, minimum and maximum "
-            "(<attribute>_days and/or <attribute>_years)."
+            "Retention configuration is not valid. "
+            "You must set default, minimum and maximum (in days and/or years)."
         )
     else:
         if minimum <= 0 or minimum > default:
@@ -173,12 +169,9 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
 
         existing_immutability["retention"] = {
             "retention_enabled": True,
-            "default_days": default,
-            "default_years": None,
-            "minimum_days": minimum,
-            "minimum_years": None,
-            "maximum_days": maximum,
-            "maximum_years": None,
+            "default": default,
+            "minimum": minimum,
+            "maximum": maximum,
         }
         logging.info(f"validate_immutability13 : {existing_immutability}")
 
