@@ -1,9 +1,17 @@
-from typing import Optional
 from pydantic import BaseModel, root_validator
 
 DAYS_PER_YEAR = 365
-COS_MAX_RETENTION_DAYS = 365_243   # limite IBM COS (1000 ans)
+MAX_RETENTION_YEARS = 5
+MAX_RETENTION_DAYS = MAX_RETENTION_YEARS * DAYS_PER_YEAR  # 1825
+
+DAYS = "days"
+YEARS = "years"
+_UNITS = (DAYS, YEARS)
 _KEYS = ("default", "minimum", "maximum")
+
+# Plafond métier exprimé dans chaque unité : aucune conversion n'est faite,
+# la valeur saisie est comparée telle quelle puis transmise telle quelle à COS.
+MAX_RETENTION = {DAYS: MAX_RETENTION_DAYS, YEARS: MAX_RETENTION_YEARS}
 
 
 class BucketRetention(BaseModel):
@@ -17,19 +25,11 @@ class BucketRetention(BaseModel):
 
     # ── helpers ──────────────────────────────────────────────────────────
     @staticmethod
-    def _to_days(days: int | None, years: int | None) -> int | None:
-        if days is not None:
-            return days
-        if years is not None:
-            return years * DAYS_PER_YEAR
-        return None
-
-    @staticmethod
-    def _to_years(days: int | None, years: int | None) -> float | None:
-        if years is not None:
-            return float(years)
-        if days is not None:
-            return days / DAYS_PER_YEAR
+    def _unit_of(get) -> str | None:
+        """Unité effectivement saisie ("days", "years") ou None si rien n'est saisi."""
+        for unit in _UNITS:
+            if any(get(f"{k}_{unit}") is not None for k in _KEYS):
+                return unit
         return None
 
     # ── 1. Auto-enable si un paramètre est fourni sans le flag ───────────
@@ -39,34 +39,47 @@ class BucketRetention(BaseModel):
         any_retention_param = any(
             values.get(f"{k}_{unit}") is not None
             for k in _KEYS
-            for unit in ("days", "years")
+            for unit in _UNITS
         )
         if not retention_flag_given and any_retention_param:
             values["retention_enabled"] = True
         return values
 
-    # ── 2. Exclusivité days / years + valeurs positives ──────────────────
+    # ── 2. Une seule unité pour tout le bloc + valeurs positives ─────────
     @root_validator(pre=True)
-    def _days_xor_years(cls, values: dict) -> dict:
+    def _single_unit(cls, values: dict) -> dict:
+        used = [unit for unit in _UNITS
+                if any(values.get(f"{k}_{unit}") is not None for k in _KEYS)]
+        if len(used) > 1:
+            raise ValueError(
+                "retention: saisir les trois attributs en jours (…_days) OU en années "
+                "(…_years), jamais un mélange des deux"
+            )
         for k in _KEYS:
-            d, y = values.get(f"{k}_days"), values.get(f"{k}_years")
-            if d is not None and y is not None:
-                raise ValueError(f"{k}: fournir {k}_days OU {k}_years, pas les deux")
-            for name, v in ((f"{k}_days", d), (f"{k}_years", y)):
+            for unit in _UNITS:
+                v = values.get(f"{k}_{unit}")
                 if v is not None and int(v) <= 0:
-                    raise ValueError(f"{name} doit être > 0")
+                    raise ValueError(f"{k}_{unit} doit être > 0")
         return values
 
-    # ── 3. Cohérence min ≤ default ≤ max et plafond COS ──────────────────
+    # ── 3. Cohérence min ≤ default ≤ max et plafond 5 ans ────────────────
     @root_validator(skip_on_failure=True)
     def _check_bounds(cls, values: dict) -> dict:
-        mn = cls._to_days(values.get("minimum_days"), values.get("minimum_years"))
-        df = cls._to_days(values.get("default_days"), values.get("default_years"))
-        mx = cls._to_days(values.get("maximum_days"), values.get("maximum_years"))
+        unit = cls._unit_of(values.get)
+        if unit is None:
+            return values
+
+        limit = MAX_RETENTION[unit]
+        mn = values.get(f"minimum_{unit}")
+        df = values.get(f"default_{unit}")
+        mx = values.get(f"maximum_{unit}")
 
         for name, v in (("minimum", mn), ("default", df), ("maximum", mx)):
-            if v is not None and v > COS_MAX_RETENTION_DAYS:
-                raise ValueError(f"{name} dépasse {COS_MAX_RETENTION_DAYS} jours (limite COS)")
+            if v is not None and v > limit:
+                raise ValueError(
+                    f"{name}_{unit} dépasse {limit} {unit} "
+                    f"({MAX_RETENTION_YEARS} ans maximum)"
+                )
         if mn is not None and mx is not None and mn > mx:
             raise ValueError("minimum > maximum")
         if df is not None:
@@ -76,52 +89,44 @@ class BucketRetention(BaseModel):
                 raise ValueError("default > maximum")
         return values
 
-    # ── Propriétés normalisées en jours (compat avec le reste du code) ───
+    # ── Lecture : l'unité saisie et les valeurs brutes, sans conversion ──
+    @property
+    def unit(self) -> str | None:
+        return self._unit_of(lambda name: getattr(self, name))
+
+    def _value(self, key: str) -> int | None:
+        unit = self.unit
+        return getattr(self, f"{key}_{unit}") if unit else None
+
     @property
     def default(self) -> int | None:
-        return self._to_days(self.default_days, self.default_years)
+        return self._value("default")
 
     @property
     def minimum(self) -> int | None:
-        return self._to_days(self.minimum_days, self.minimum_years)
+        return self._value("minimum")
 
     @property
     def maximum(self) -> int | None:
-        return self._to_days(self.maximum_days, self.maximum_years)
-
-    # ── Lecture dans les deux unités pour chacun des trois attributs ────
-    @property
-    def default_in_days(self) -> int | None:
-        return self._to_days(self.default_days, self.default_years)
+        return self._value("maximum")
 
     @property
-    def default_in_years(self) -> float | None:
-        return self._to_years(self.default_days, self.default_years)
-
-    @property
-    def minimum_in_days(self) -> int | None:
-        return self._to_days(self.minimum_days, self.minimum_years)
-
-    @property
-    def minimum_in_years(self) -> float | None:
-        return self._to_years(self.minimum_days, self.minimum_years)
-
-    @property
-    def maximum_in_days(self) -> int | None:
-        return self._to_days(self.maximum_days, self.maximum_years)
-
-    @property
-    def maximum_in_years(self) -> float | None:
-        return self._to_years(self.maximum_days, self.maximum_years)
+    def max_allowed(self) -> int | None:
+        """Plafond applicable dans l'unité saisie : 1825 jours ou 5 années."""
+        unit = self.unit
+        return MAX_RETENTION[unit] if unit else None
 
     def __iter__(self):
+        yield "unit", self.unit
         yield "default", self.default
         yield "minimum", self.minimum
         yield "maximum", self.maximum
 
     def is_empty(self) -> bool:
-        return self.default is None and self.minimum is None and self.maximum is None
+        return self.unit is None
 
     def to_cos_payload(self) -> dict:
-        """Dict prêt pour le body PUT ?protection / retention_rule Terraform (en jours)."""
+        """Dict prêt pour le retention_rule Terraform, dans l'unité saisie par le client."""
+        if self.is_empty():
+            return {}
         return {k: v for k, v in self if v is not None}
