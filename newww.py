@@ -2,8 +2,16 @@ DAYS_PER_YEAR = 365  # MAX_RETENTION_DAYS = 5 * 365 = 1825
 
 
 def compute_total_object_lock_days(days, years) -> int:
-    """Convertit la saisie utilisateur (jours/années) en total de jours."""
-    return (days or 0) + (years or 0) * DAYS_PER_YEAR
+    """Convertit la saisie utilisateur (jours OU années) en nombre de jours.
+
+    Le client renseigne une seule des deux unités ; les deux à la fois sont
+    refusées par l'appelant. Les jours priment si jamais les deux arrivent ici.
+    """
+    if days is not None:
+        return days
+    if years is not None:
+        return years * DAYS_PER_YEAR
+    return 0
 
 
 def compute_bucket_object_lock(
@@ -17,6 +25,13 @@ def compute_bucket_object_lock(
         object_lock_duration_days,
         object_lock_duration_years,
     )
+
+    if object_lock_duration_days is not None and object_lock_duration_years is not None:
+        logging.info("compute_bucket_object_lock0a")
+        errors.append(
+            "Object lock retention must be set either in days (object_lock_duration_days) "
+            "or in years (object_lock_duration_years), not both."
+        )
 
     if (object_lock_duration_days or 0) < 0 or (object_lock_duration_years or 0) < 0:
         logging.info("compute_bucket_object_lock0")
@@ -49,14 +64,27 @@ _RETENTION_KEYS = ("default", "minimum", "maximum")
 
 
 def compute_retention_total_days(days, years):
-    """Total de jours pour un attribut de rétention, ou None si rien n'est saisi."""
+    """Nombre de jours d'un attribut de rétention (jours OU années), None si non saisi."""
     if days is None and years is None:
         return None
     return compute_total_object_lock_days(days, years)
 
 
+def check_retention_units(retention, errors) -> None:
+    """Refuse les attributs de rétention renseignés à la fois en jours et en années."""
+    for key in _RETENTION_KEYS:
+        if getattr(retention, f"{key}_days") is not None and getattr(retention, f"{key}_years") is not None:
+            logging.info(f"check_retention_units {key}")
+            errors.append(
+                f"Retention {key} must be set either in days ({key}_days) "
+                f"or in years ({key}_years), not both."
+            )
+
+
 def compute_bucket_retention(retention: BucketRetention, immutability: dict, operation: str) -> dict:
     errors = []
+
+    check_retention_units(retention, errors)
 
     totals = {
         key: compute_retention_total_days(
@@ -69,10 +97,11 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict, ope
 
     if default is None or minimum is None or maximum is None:
         logging.info("compute_bucket_retention1")
-        raise DeclineDemandException(
+        errors.append(
             "Retention configuration is not valid. You must set all attributes "
-            "(<attribute>_days and/or <attribute>_years) to update the existing bucket retention."
+            "(<attribute>_days or <attribute>_years) to update the existing bucket retention."
         )
+        raise DeclineDemandException(" | ".join(errors))
 
     if minimum <= 0 or minimum > default:
         logging.info("compute_bucket_retention2")
@@ -125,6 +154,7 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
         existing_retention = existing_immutability["retention"]
         totals = {key: existing_retention[key] for key in _RETENTION_KEYS}
     else:
+        check_retention_units(retention, errors)
         totals = {
             key: compute_retention_total_days(
                 getattr(retention, f"{key}_days"),
@@ -143,7 +173,7 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
         logging.info("validate_immutability9b")
         errors.append(
             "Retention configuration is not valid. "
-            "You must set default, minimum and maximum (in days and/or years)."
+            "You must set default, minimum and maximum (in days or in years)."
         )
     else:
         if minimum <= 0 or minimum > default:
