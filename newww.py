@@ -1,3 +1,7 @@
+# 1 an = 365 jours par convention (comme l'object lock S3/COS) : le plafond est
+# une constante, pas un calendrier. La fenêtre de rétention démarre à l'écriture
+# de chaque objet, pas à la création du bucket, donc il n'existe pas de "nombre
+# exact de jours pour 5 ans" à la date de la demande.
 # Mêmes constantes que bucket_retention.py — à importer depuis le modèle
 # une fois le snippet recollé dans le vrai projet.
 DAYS_PER_YEAR = 365
@@ -9,6 +13,13 @@ YEARS = "years"
 MAX_RETENTION = {DAYS: MAX_RETENTION_DAYS, YEARS: MAX_RETENTION_YEARS}
 
 _RETENTION_KEYS = ("default", "minimum", "maximum")
+
+
+def format_limit(unit) -> str:
+    """Plafond lisible dans l'unité saisie : "5 years" ou "5 years (1825 days)"."""
+    if unit == YEARS:
+        return f"{MAX_RETENTION_YEARS} years"
+    return f"{MAX_RETENTION_YEARS} years ({MAX_RETENTION_DAYS} days)"
 
 
 def check_single_unit(days, years, label, days_field, years_field, errors) -> str | None:
@@ -49,8 +60,7 @@ def check_retention_bounds(unit, default, minimum, maximum, errors) -> None:
         logging.info("check_retention_bounds3")
         errors.append(
             f"Retention maximum ({maximum} {unit}) cannot be inferior or equal to default "
-            f"({default} {unit}) nor superior to {MAX_RETENTION_YEARS} years "
-            f"({limit} {unit})."
+            f"({default} {unit}) nor superior to {format_limit(unit)}."
         )
 
 
@@ -91,7 +101,7 @@ def compute_bucket_object_lock(
             logging.info("compute_bucket_object_lock3")
             errors.append(
                 f"Object lock retention ({duration} {unit}) cannot be superior to "
-                f"{MAX_RETENTION_YEARS} years ({limit} {unit})."
+                f"{format_limit(unit)}."
             )
 
     if errors:
