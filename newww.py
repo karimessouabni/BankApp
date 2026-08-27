@@ -13,8 +13,11 @@ YEARS = "years"
 MAX_RETENTION = {DAYS: MAX_RETENTION_DAYS, YEARS: MAX_RETENTION_YEARS}
 
 _RETENTION_KEYS = ("default", "minimum", "maximum")
+_OBJECT_LOCK_LABEL = "Object lock retention"
+_OBJECT_LOCK_FIELDS = ("object_lock_duration_days", "object_lock_duration_years")
 
 
+# ── Briques communes create / update ─────────────────────────────────────
 def format_limit(unit) -> str:
     """Plafond lisible dans l'unité saisie : "5 years" ou "5 years (1825 days)"."""
     if unit == YEARS:
@@ -38,10 +41,40 @@ def check_single_unit(days, years, label, days_field, years_field, errors) -> st
     return None
 
 
+def check_duration_bounds(unit, duration, label, errors) -> None:
+    """Durée > 0 et ≤ 5 ans, comparée dans l'unité saisie."""
+    if duration <= 0:
+        logging.info(f"check_duration_bounds {label} zero")
+        errors.append(f"{label} ({duration} {unit}) cannot be inferior or equal to ZERO.")
+
+    if duration > MAX_RETENTION[unit]:
+        logging.info(f"check_duration_bounds {label} limit")
+        errors.append(
+            f"{label} ({duration} {unit}) cannot be superior to {format_limit(unit)}."
+        )
+
+
+def resolve_object_lock(days, years, errors):
+    """(unité, durée) de l'object lock, validées. (None, None) si rien n'est saisi."""
+    unit = check_single_unit(days, years, _OBJECT_LOCK_LABEL, *_OBJECT_LOCK_FIELDS, errors)
+    if unit is None:
+        return None, None
+
+    duration = days if unit == DAYS else years
+    check_duration_bounds(unit, duration, _OBJECT_LOCK_LABEL, errors)
+    return unit, duration
+
+
+def write_object_lock(immutability, unit, duration) -> None:
+    """Écrit l'object lock dans l'unité saisie ; l'autre unité reste à None."""
+    immutability["object_locking_enabled"] = True
+    immutability["object_versioning_enabled"] = True
+    immutability["object_lock_duration_days"] = duration if unit == DAYS else None
+    immutability["object_lock_duration_years"] = duration if unit == YEARS else None
+
+
 def check_retention_bounds(unit, default, minimum, maximum, errors) -> None:
     """Applique min ≤ default ≤ max et le plafond 5 ans, dans l'unité saisie."""
-    limit = MAX_RETENTION[unit]
-
     if minimum <= 0 or minimum > default:
         logging.info("check_retention_bounds1")
         errors.append(
@@ -56,7 +89,7 @@ def check_retention_bounds(unit, default, minimum, maximum, errors) -> None:
             f"({minimum} {unit}) nor superior or equal to maximum ({maximum} {unit})."
         )
 
-    if maximum > limit or maximum <= default:
+    if maximum > MAX_RETENTION[unit] or maximum <= default:
         logging.info("check_retention_bounds3")
         errors.append(
             f"Retention maximum ({maximum} {unit}) cannot be inferior or equal to default "
@@ -64,6 +97,13 @@ def check_retention_bounds(unit, default, minimum, maximum, errors) -> None:
         )
 
 
+def raise_on_errors(errors) -> None:
+    if errors:
+        global_message = " | ".join(errors)
+        raise DeclineDemandException(global_message)
+
+
+# ── CREATE ───────────────────────────────────────────────────────────────
 def compute_bucket_object_lock(
     immutability,
     object_lock_duration_days,
@@ -71,54 +111,27 @@ def compute_bucket_object_lock(
 ):
     errors = []
 
-    unit = check_single_unit(
+    unit, duration = resolve_object_lock(
         object_lock_duration_days,
         object_lock_duration_years,
-        "Object lock retention",
-        "object_lock_duration_days",
-        "object_lock_duration_years",
         errors,
     )
 
     if unit is None and not errors:
         logging.info("compute_bucket_object_lock1")
         errors.append(
-            "Object lock retention must be set, either in days "
-            "(object_lock_duration_days) or in years (object_lock_duration_years)."
+            f"{_OBJECT_LOCK_LABEL} must be set, either in days "
+            f"({_OBJECT_LOCK_FIELDS[0]}) or in years ({_OBJECT_LOCK_FIELDS[1]})."
         )
 
-    if unit is not None:
-        duration = object_lock_duration_days if unit == DAYS else object_lock_duration_years
-        limit = MAX_RETENTION[unit]
+    raise_on_errors(errors)
 
-        if duration <= 0:
-            logging.info("compute_bucket_object_lock2")
-            errors.append(
-                f"Object lock retention ({duration} {unit}) cannot be inferior or equal to ZERO."
-            )
-
-        if duration > limit:
-            logging.info("compute_bucket_object_lock3")
-            errors.append(
-                f"Object lock retention ({duration} {unit}) cannot be superior to "
-                f"{format_limit(unit)}."
-            )
-
-    if errors:
-        global_message = " | ".join(errors)
-        raise DeclineDemandException(global_message)
-
-    immutability["object_locking_enabled"] = True
-    immutability["object_versioning_enabled"] = True
-    # L'unité saisie est conservée telle quelle : l'autre reste à None.
-    immutability["object_lock_duration_days"] = object_lock_duration_days
-    immutability["object_lock_duration_years"] = object_lock_duration_years
-
-    logging.info(f"compute_bucket_object_lock4 {immutability}")
+    write_object_lock(immutability, unit, duration)
+    logging.info(f"compute_bucket_object_lock2 {immutability}")
     return immutability
 
 
-def compute_bucket_retention(retention: BucketRetention, immutability: dict, operation: str) -> dict:
+def compute_bucket_retention(retention, immutability: dict, operation: str) -> dict:
     errors = []
 
     unit = retention.unit
@@ -135,9 +148,7 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict, ope
     else:
         check_retention_bounds(unit, default, minimum, maximum, errors)
 
-    if errors:
-        global_message = " | ".join(errors)
-        raise DeclineDemandException(global_message)
+    raise_on_errors(errors)
 
     # Aucune conversion : seule l'unité saisie est renseignée, l'autre reste à None.
     immutability["retention"]["retention_enabled"] = retention.retention_enabled
@@ -149,21 +160,45 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict, ope
     return immutability
 
 
-def validate_immutability(retention, backup, bucket: dict, existing_immutability: dict) -> dict:
-    errors = []
+# ── UPDATE ───────────────────────────────────────────────────────────────
+def validate_object_lock_update(
+    existing_immutability: dict,
+    object_lock_duration_days,
+    object_lock_duration_years,
+    errors,
+) -> None:
+    """Object lock côté update : la saisie remplace l'existant, sinon on le garde."""
+    if object_lock_duration_days is None and object_lock_duration_years is None:
+        logging.info("validate_immutability4")
+        # Rien de resaisi : on reprend l'existant dans son unité d'origine.
+        object_lock_duration_days = existing_immutability.get("object_lock_duration_days")
+        object_lock_duration_years = existing_immutability.get("object_lock_duration_years")
 
-    if backup and not backup.is_empty() and backup.backup_enabled:
-        errors.append(
-            "Retention and bucket backup are not compatible. "
-            "We cannot activate backup when retention is enabled."
-        )
+    unit, duration = resolve_object_lock(
+        object_lock_duration_days,
+        object_lock_duration_years,
+        errors,
+    )
 
+    # unit None sans erreur = pas d'object lock sur ce bucket, rien à valider.
+    if unit is not None:
+        write_object_lock(existing_immutability, unit, duration)
+        logging.info(f"validate_immutability5 : {existing_immutability}")
+
+
+def validate_retention_update(
+    retention,
+    bucket: dict,
+    existing_immutability: dict,
+    errors,
+) -> None:
+    """Rétention côté update : saisie complète, ou complétée depuis la base à unité égale."""
     existing_retention = existing_immutability["retention"]
     # Les buckets créés avant l'ajout des années sont stockés en jours.
     existing_unit = existing_retention.get("unit") or DAYS
 
     if not retention or retention.is_empty() or not retention.retention_enabled:
-        logging.info("validate_immutability9")
+        logging.info("validate_immutability6")
         unit = existing_unit
         values = {key: existing_retention[key] for key in _RETENTION_KEYS}
     else:
@@ -175,35 +210,59 @@ def validate_immutability(retention, backup, bucket: dict, existing_immutability
             for key in missing:
                 values[key] = bucket[f"retention_{key}"]
         elif missing:
-            logging.info("validate_immutability9a")
+            logging.info("validate_immutability7")
             errors.append(
                 f"Retention is currently set in {existing_unit}. Switching to {unit} requires "
                 f"default, minimum and maximum to be submitted together."
             )
+            return
 
     default, minimum, maximum = values["default"], values["minimum"], values["maximum"]
-    incomplete = default is None or minimum is None or maximum is None
 
-    if incomplete and not errors:
-        logging.info("validate_immutability10")
+    if default is None or minimum is None or maximum is None:
+        logging.info("validate_immutability8")
         errors.append(
             "Retention configuration is not valid. You must set default, minimum and maximum "
             "in the same unit, either in days or in years."
         )
-    elif not incomplete:
-        check_retention_bounds(unit, default, minimum, maximum, errors)
+        return
 
-        existing_immutability["retention"] = {
-            "retention_enabled": True,
-            "unit": unit,
-            "default": default,
-            "minimum": minimum,
-            "maximum": maximum,
-        }
-        logging.info(f"validate_immutability11 : {existing_immutability}")
+    check_retention_bounds(unit, default, minimum, maximum, errors)
 
-    if errors:
-        global_message = " | ".join(errors)
-        raise DeclineDemandException(global_message)
+    existing_immutability["retention"] = {
+        "retention_enabled": True,
+        "unit": unit,
+        "default": default,
+        "minimum": minimum,
+        "maximum": maximum,
+    }
+    logging.info(f"validate_immutability9 : {existing_immutability}")
 
+
+def validate_immutability(
+    retention,
+    backup,
+    bucket: dict,
+    existing_immutability: dict,
+    object_lock_duration_days=None,
+    object_lock_duration_years=None,
+) -> dict:
+    errors = []
+
+    if backup and not backup.is_empty() and backup.backup_enabled:
+        errors.append(
+            "Retention and bucket backup are not compatible. "
+            "We cannot activate backup when retention is enabled."
+        )
+
+    validate_object_lock_update(
+        existing_immutability,
+        object_lock_duration_days,
+        object_lock_duration_years,
+        errors,
+    )
+
+    validate_retention_update(retention, bucket, existing_immutability, errors)
+
+    raise_on_errors(errors)
     return existing_immutability
