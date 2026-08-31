@@ -227,21 +227,32 @@ def validate_retention_update(
     logging.info(f"validate_immutability8 : {existing_immutability}")
 
 
-def validate_immutability(
-    retention,
-    backup,
-    bucket: dict,
-    existing_immutability: dict,
-    object_lock_duration_days=None,
-    object_lock_duration_years=None,
-) -> dict:
-    errors = []
+def _backup_requested(backup) -> bool:
+    return bool(backup and not backup.is_empty() and backup.backup_enabled)
 
-    if backup and not backup.is_empty() and backup.backup_enabled:
-        errors.append(
-            "Retention and bucket backup are not compatible. "
-            "We cannot activate backup when retention is enabled."
-        )
+
+def _apply_versioning_only_update(existing_immutability: dict, enable_versioning) -> None:
+    """Choix NONE : seule la bascule de versioning est appliquée, le reste est conservé."""
+    if enable_versioning is None:
+        enable_versioning = existing_immutability["object_versioning_enabled"]
+    existing_immutability["object_versioning_enabled"] = enable_versioning
+    logging.info(f"validate_immutability1 : {existing_immutability}")
+
+
+def _update_object_locked_bucket(
+    existing_immutability: dict,
+    retention,
+    enable_versioning,
+    object_lock_duration_days,
+    object_lock_duration_years,
+    errors,
+) -> None:
+    """Bucket déjà en object-lock : ni rétention ni arrêt du versioning, durée remplaçable."""
+    if retention is not None:
+        errors.append("Setting a retention is not possible when object-lock is already enabled.")
+
+    if enable_versioning is False:
+        errors.append("Disabling versioning is not possible when object-lock is already enabled.")
 
     validate_object_lock_update(
         existing_immutability,
@@ -250,9 +261,105 @@ def validate_immutability(
         errors,
     )
 
+
+def _update_retention_bucket(
+    existing_immutability: dict,
+    bucket: dict,
+    retention,
+    backup,
+    enable_versioning,
+    object_lock_duration_days,
+    object_lock_duration_years,
+    errors,
+) -> None:
+    """Bucket déjà en rétention : ni object-lock, ni versioning, ni backup."""
+    if object_lock_duration_days is not None or object_lock_duration_years is not None:
+        errors.append("Setting an object-lock is not possible when retention is already enabled.")
+
+    if enable_versioning:
+        errors.append("Enabling versioning is not possible when retention is already enabled.")
+
+    if _backup_requested(backup):
+        errors.append(
+            "Retention and bucket backup are not compatible. "
+            "We cannot activate backup when retention is enabled."
+        )
+
     validate_retention_update(retention, bucket, existing_immutability, errors)
 
+
+def validate_immutability_for_update_bucket(
+    bucket: dict,
+    immutability_choice,
+    retention,
+    object_lock_duration_days: int | None,
+    object_lock_duration_years: int | None,
+    enable_versioning,
+    has_contents: bool,
+    backup,
+    session,
+) -> dict:
+    """Orchestration de l'update : valide la demande contre l'état actuel du bucket.
+
+    Immutability, compute_bucket_immutability_choice, compute_bucket_new_immutability
+    et compute_bucket_backup viennent du reste du service. Toutes les erreurs sont
+    accumulées puis levées en une seule DeclineDemandException.
+    """
+    existing_immutability = compute_bucket_immutability_for_update_bucket(bucket, session)
+    existing_choice = compute_bucket_immutability_choice(bucket)
+    errors = []
+
+    if immutability_choice == Immutability.NONE:
+        _apply_versioning_only_update(existing_immutability, enable_versioning)
+
+    if existing_choice is None:
+        logging.info("validate_immutability2")
+        existing_immutability = compute_bucket_new_immutability(
+            immutability_choice,
+            retention,
+            object_lock_duration_days,
+            object_lock_duration_years,
+            enable_versioning,
+            existing_immutability,
+            backup,
+        )
+
+    if existing_immutability["retention"]["retention_enabled"] and has_contents:
+        errors.append("Setting a retention is not possible when the bucket already contains objects.")
+
+    if existing_choice == Immutability.OBJECT_LOCK:
+        logging.info("validate_immutability3")
+        _update_object_locked_bucket(
+            existing_immutability,
+            retention,
+            enable_versioning,
+            object_lock_duration_days,
+            object_lock_duration_years,
+            errors,
+        )
+
+    if existing_choice == Immutability.RETENTION:
+        logging.info("validate_immutability8")
+        _update_retention_bucket(
+            existing_immutability,
+            bucket,
+            retention,
+            backup,
+            enable_versioning,
+            object_lock_duration_days,
+            object_lock_duration_years,
+            errors,
+        )
+
     raise_on_errors(errors)
+
+    if _backup_requested(backup) and (
+        immutability_choice == Immutability.NONE or existing_choice == Immutability.OBJECT_LOCK
+    ):
+        logging.info(f"validate_immutability14 : {backup}")
+        existing_immutability = compute_bucket_backup(existing_immutability, backup)
+
+    logging.info(f"validate_immutability15 : {existing_immutability}")
     return existing_immutability
 
 
