@@ -77,15 +77,15 @@ class BucketRetention(BaseModel):
                 if any(getattr(self, f"{k}_{unit}") is not None for k in _KEYS)]
         if len(used) > 1:
             errors.append(
-                "retention: saisir les trois attributs en jours (…_days) OU en années "
-                "(…_years), jamais un mélange des deux"
+                "Retention must be set either in days (…_days) or in years (…_years) "
+                "for all three attributes, not a mix of both."
             )
 
         for k in _KEYS:
             for unit in _UNITS:
                 v = getattr(self, f"{k}_{unit}")
                 if v is not None and v <= 0:
-                    errors.append(f"{k}_{unit} doit être > 0")
+                    errors.append(f"{k}_{unit} must be superior to 0.")
 
         # Bornes et plafond : seulement quand l'unité est non ambiguë.
         if len(used) == 1:
@@ -96,16 +96,16 @@ class BucketRetention(BaseModel):
             for name, v in (("minimum", mn), ("default", df), ("maximum", mx)):
                 if v is not None and v > limit:
                     errors.append(
-                        f"{name}_{unit} dépasse {limit} {unit} "
-                        f"({MAX_RETENTION_YEARS} ans maximum, années bissextiles comprises)"
+                        f"{name}_{unit} ({v} {unit}) cannot be superior to "
+                        f"{MAX_RETENTION_YEARS} years ({limit} {unit}, leap years included)."
                     )
             if mn is not None and mx is not None and mn > mx:
-                errors.append("minimum > maximum")
+                errors.append("Retention minimum cannot be superior to maximum.")
             if df is not None:
                 if mn is not None and df < mn:
-                    errors.append("default < minimum")
+                    errors.append("Retention default cannot be inferior to minimum.")
                 if mx is not None and df > mx:
-                    errors.append("default > maximum")
+                    errors.append("Retention default cannot be superior to maximum.")
 
         if errors:
             raise ValueError(" | ".join(errors))
