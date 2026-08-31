@@ -497,13 +497,29 @@ def _backup_from_bucket(bucket: dict, session) -> dict:
 
 
 def compute_bucket_immutability_for_update_bucket(bucket: dict, session) -> dict:
-    """Reconstruit le bloc immutability existant depuis la ligne bucket en base."""
+    """Reconstruit le bloc immutability existant depuis la ligne bucket en base.
+
+    Garantit qu'une seule unité d'object lock en sort : c'est ce dict qui part
+    ensuite vers Terraform, où les deux variables à la fois créent un conflit.
+    """
+    object_lock_duration_days = bucket["object_lock_duration_days"]
+    object_lock_duration_years = bucket.get("object_lock_duration_years")
+
+    if object_lock_duration_days is not None and object_lock_duration_years is not None:
+        # Ligne héritée d'un ancien update qui n'effaçait pas l'autre unité :
+        # on garde les jours (colonne d'origine) plutôt que de bloquer le client.
+        logging.warning(
+            "bucket stores object lock in both units "
+            f"(days={object_lock_duration_days}, years={object_lock_duration_years}), keeping days"
+        )
+        object_lock_duration_years = None
+
     immutability = {
-        "object_locking_enabled": bucket["object_lock_duration_days"] is not None,
+        "object_locking_enabled": object_lock_duration_days is not None
+        or object_lock_duration_years is not None,
         "object_versioning_enabled": bool(bucket.get("object_versioning_enabled")),
-        "object_lock_duration_days": bucket["object_lock_duration_days"],
-        # Colonne à venir si l'object lock doit conserver une saisie en années.
-        "object_lock_duration_years": bucket.get("object_lock_duration_years"),
+        "object_lock_duration_days": object_lock_duration_days,
+        "object_lock_duration_years": object_lock_duration_years,
         "retention": _retention_from_bucket(bucket),
         "backup": _backup_from_bucket(bucket, session),
     }
