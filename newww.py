@@ -462,8 +462,12 @@ def validate_immutability_for_update_bucket(
 
     raise_on_errors(errors)
 
-    if _backup_requested(backup) and (
-        immutability_choice == Immutability.NONE or existing_choice == Immutability.OBJECT_LOCK
+    # Le backup s'applique exactement une fois : le chemin "bucket vierge"
+    # (existing_choice is None) l'a déjà appliqué via compute_bucket_new_immutability.
+    if (
+        existing_choice is not None
+        and _backup_requested(backup)
+        and (immutability_choice == Immutability.NONE or existing_choice == Immutability.OBJECT_LOCK)
     ):
         logging.info(f"validate_immutability14 : {backup}")
         existing_immutability = compute_bucket_backup(existing_immutability, backup)
