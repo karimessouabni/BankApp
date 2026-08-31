@@ -525,3 +525,66 @@ def compute_bucket_immutability_for_update_bucket(bucket: dict, session) -> dict
     }
     logging.info(f"compute_bucket_immutability_for_update_bucket : {immutability}")
     return immutability
+
+
+def immutability_choice_of(immutability: dict):
+    """Choix d'immutabilité correspondant à un bloc immutability appliqué."""
+    if immutability["retention"]["retention_enabled"]:
+        return Immutability.RETENTION
+    if immutability["object_locking_enabled"]:
+        return Immutability.OBJECT_LOCK
+    return Immutability.NONE
+
+
+def save_bucket_in_db(
+    bucket: dict,
+    immutability: dict,
+    is_update_ws_done: bool,  # uniquement pour l'ordonnancement Airflow
+    payload,
+    state_manager,
+    session,
+) -> dict:
+    """Persiste l'état APPLIQUÉ du bucket, jamais le payload brut.
+
+    immutability sort de la validation : il fusionne déjà la saisie et
+    l'existant, avec l'unité d'object lock inutilisée à None. Le pousser tel
+    quel écrit toujours les deux unités — aucune valeur résiduelle ne survit
+    en base lors d'un changement d'unité — et reste idempotent pour les
+    champs non modifiés.
+    """
+    from cos_service.services.bucketService import (
+        process_bucket_update,
+        update_bucket_workspace_status,
+    )
+
+    subscription_details = state_manager.get_subscription()
+
+    # Seul champ hors immutability : repli sur la valeur déjà en base.
+    enable_custom_permissions = (
+        payload.enable_custom_permissions
+        if payload.enable_custom_permissions is not None
+        else bucket["enable_custom_permissions"]
+    )
+
+    state_manager.push_state({
+        "retention": immutability["retention"],
+        "object_lock_duration_days": immutability["object_lock_duration_days"],
+        "object_lock_duration_years": immutability["object_lock_duration_years"],
+        "object_locking_enabled": immutability["object_locking_enabled"],
+        "enable_versioning": immutability["object_versioning_enabled"],
+        "backup": immutability["backup"],
+        "enable_custom_permissions": enable_custom_permissions,
+        "immutability_choice": immutability_choice_of(immutability),
+    })
+
+    process_bucket_update(
+        payload.subscription_id,
+        immutability,
+        enable_custom_permissions,
+        subscription_details.description,
+        session,
+    )
+    update_bucket_workspace_status(payload.subscription_id, Status.SUCCESS, session)
+
+    logging.info(f"save_bucket_in_db : {immutability}")
+    return {"subscription_id": payload.subscription_id}
