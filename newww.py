@@ -254,3 +254,42 @@ def validate_immutability(
 
     raise_on_errors(errors)
     return existing_immutability
+
+
+def _retention_from_bucket(bucket: dict) -> dict:
+    """Bloc retention (en jours) depuis la ligne bucket ; valeurs à None si désactivée."""
+    enabled = bool(bucket["retention_enabled"])
+    return {
+        "retention_enabled": enabled,
+        **{key: bucket[f"retention_{key}"] if enabled else None for key in _RETENTION_KEYS},
+    }
+
+
+def _backup_from_bucket(bucket: dict, session) -> dict:
+    """Bloc backup depuis la ligne bucket ; le vault n'est résolu que si nécessaire."""
+    if not bucket["backup_enabled"]:
+        return {"backup_enabled": False, "backup_vault_sub_id": None, "backup_retention_days": None}
+
+    from cos_service.services.backup_vault_service import get_backup_vault_by_sub_id
+
+    backup_vault = get_backup_vault_by_sub_id(bucket["backup_vault_subscription_id"], session)
+    return {
+        "backup_enabled": True,
+        "backup_vault_sub_id": backup_vault.subscription_id,
+        "backup_retention_days": bucket["backup_retention_days"],
+    }
+
+
+def compute_bucket_immutability_for_update_bucket(bucket: dict, session) -> dict:
+    """Reconstruit le bloc immutability existant depuis la ligne bucket en base."""
+    immutability = {
+        "object_locking_enabled": bucket["object_lock_duration_days"] is not None,
+        "object_versioning_enabled": bool(bucket.get("object_versioning_enabled")),
+        "object_lock_duration_days": bucket["object_lock_duration_days"],
+        # Colonne à venir si l'object lock doit conserver une saisie en années.
+        "object_lock_duration_years": bucket.get("object_lock_duration_years"),
+        "retention": _retention_from_bucket(bucket),
+        "backup": _backup_from_bucket(bucket, session),
+    }
+    logging.info(f"compute_bucket_immutability_for_update_bucket : {immutability}")
+    return immutability
