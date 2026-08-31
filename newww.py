@@ -236,7 +236,116 @@ def _apply_versioning_only_update(existing_immutability: dict, enable_versioning
     if enable_versioning is None:
         enable_versioning = existing_immutability["object_versioning_enabled"]
     existing_immutability["object_versioning_enabled"] = enable_versioning
-    logging.info(f"validate_immutability1 : {existing_immutability}")
+    logging.info(f"apply_versioning_only : {existing_immutability}")
+
+
+def _retention_requested(payload_retention) -> bool:
+    return bool(payload_retention and not payload_retention.is_empty()
+                and payload_retention.retention_enabled)
+
+
+def _object_lock_requested(object_lock_duration_days, object_lock_duration_years) -> bool:
+    return object_lock_duration_days is not None or object_lock_duration_years is not None
+
+
+def _infer_immutability_choice(payload_retention, object_lock_duration_days, object_lock_duration_years):
+    """Choix implicite quand le payload n'en donne pas : déduit de ce qui est saisi."""
+    retention_given = _retention_requested(payload_retention)
+    lock_given = _object_lock_requested(object_lock_duration_days, object_lock_duration_years)
+
+    if retention_given and lock_given:
+        raise DeclineDemandException(
+            "Retention and object Lock are not compatible. "
+            "We cannot activate both of them simultaneously."
+        )
+    if retention_given:
+        return Immutability.RETENTION
+    if lock_given:
+        return Immutability.OBJECT_LOCK
+    return Immutability.NONE
+
+
+def _new_retention_immutability(payload_retention, enable_versioning, backup, immutability: dict) -> dict:
+    """Nouvelle immutabilité en mode rétention : incompatibilités puis calcul."""
+    errors = []
+
+    if enable_versioning:
+        errors.append(
+            "Retention and versioning are not compatible. "
+            "We cannot activate both of them simultaneously."
+        )
+    if _backup_requested(backup):
+        errors.append(
+            "Retention and bucket backup are not compatible. "
+            "We cannot activate backup when retention is enabled."
+        )
+    if not _retention_requested(payload_retention):
+        errors.append("Retention must not be empty.")
+
+    raise_on_errors(errors)
+    return compute_bucket_retention(payload_retention, immutability)
+
+
+def _new_object_lock_immutability(
+    object_lock_duration_days,
+    object_lock_duration_years,
+    enable_versioning,
+    immutability: dict,
+) -> dict:
+    """Nouvelle immutabilité en mode object-lock : versioning requis, durée obligatoire."""
+    errors = []
+
+    if not enable_versioning:
+        errors.append("Versioning should be enabled to enable object-lock.")
+    if not _object_lock_requested(object_lock_duration_days, object_lock_duration_years):
+        errors.append("Object Lock Duration Days or Years must be not empty.")
+
+    raise_on_errors(errors)
+    return compute_bucket_object_lock(
+        immutability, object_lock_duration_days, object_lock_duration_years
+    )
+
+
+def compute_bucket_new_immutability(
+    immutability_choice,
+    payload_retention,
+    object_lock_duration_days,
+    object_lock_duration_years,
+    enable_versioning,
+    immutability: dict,
+    backup,
+) -> dict:
+    """Construit le bloc immutability d'un bucket qui n'en avait pas encore.
+
+    Sans choix explicite dans le payload, le choix est déduit de ce qui est
+    saisi : rétention -> RETENTION, durée d'object-lock -> OBJECT_LOCK, sinon
+    NONE (seule la bascule de versioning est appliquée).
+    """
+    if immutability_choice is None:
+        immutability_choice = _infer_immutability_choice(
+            payload_retention, object_lock_duration_days, object_lock_duration_years
+        )
+        logging.info(f"compute_bucket_new_immutability choix déduit : {immutability_choice}")
+
+    if immutability_choice == Immutability.RETENTION:
+        immutability = _new_retention_immutability(
+            payload_retention, enable_versioning, backup, immutability
+        )
+    elif immutability_choice == Immutability.OBJECT_LOCK:
+        immutability = _new_object_lock_immutability(
+            object_lock_duration_days,
+            object_lock_duration_years,
+            enable_versioning,
+            immutability,
+        )
+    else:
+        _apply_versioning_only_update(immutability, enable_versioning)
+
+    if _backup_requested(backup):
+        immutability = compute_bucket_backup(immutability, backup)
+
+    logging.info(f"compute_bucket_new_immutability : {immutability}")
+    return immutability
 
 
 def _update_object_locked_bucket(
