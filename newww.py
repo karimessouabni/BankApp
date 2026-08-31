@@ -10,10 +10,15 @@ DAYS = "days"
 YEARS = "years"
 
 
+def years_to_days(years, start: date | None = None) -> int:
+    """Équivalent exact en jours de `years` années à partir de `start` (bissextiles comprises)."""
+    start = start or date.today()
+    return (start + relativedelta(years=years) - start).days
+
+
 def max_retention_days(start: date | None = None) -> int:
     """Nombre exact de jours dans 5 ans à partir de `start` (bissextiles comprises)."""
-    start = start or date.today()
-    return (start + relativedelta(years=MAX_RETENTION_YEARS) - start).days
+    return years_to_days(MAX_RETENTION_YEARS, start)
 
 
 def max_retention(unit) -> int:
@@ -144,8 +149,9 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict) -> 
 
     Le modèle garantit déjà une unité unique ; ici on exige les trois attributs
     et on applique min ≤ default ≤ max ainsi que le plafond de 5 ans, dans
-    l'unité saisie. Aucune conversion : les champs du modèle sont recopiés tels
-    quels, l'unité non utilisée reste à None.
+    l'unité saisie. La sortie reprend la forme d'origine : default / minimum /
+    maximum en nombre de jours, calculés depuis les days ou les years saisis
+    (conversion calendaire, bissextiles comprises).
     """
     unit = retention.unit
     default, minimum, maximum = retention.default, retention.minimum, retention.maximum
@@ -163,8 +169,7 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict) -> 
 
     immutability["retention"]["retention_enabled"] = retention.retention_enabled
     for key in _RETENTION_KEYS:
-        for u in (DAYS, YEARS):
-            immutability["retention"][f"{key}_{u}"] = getattr(retention, f"{key}_{u}")
+        immutability["retention"][key] = retention.in_days(key)
 
     logging.info(f"compute_bucket_retention2 {immutability}")
     return immutability
@@ -202,51 +207,42 @@ def validate_retention_update(
     existing_immutability: dict,
     errors,
 ) -> None:
-    """Rétention côté update : saisie complète, ou complétée depuis la base à unité égale."""
+    """Rétention côté update : tout est normalisé, comparé et stocké en jours.
+
+    Un attribut non resaisi est repris des colonnes retention_* du bucket
+    (déjà en jours) ; une saisie en années est convertie en jours (calendaire),
+    ce qui permet aussi de changer d'unité d'un update à l'autre.
+    """
     existing_retention = existing_immutability["retention"]
-    # Les buckets créés avant l'ajout des années sont stockés en jours.
-    existing_unit = existing_retention.get("unit") or DAYS
 
     if not retention or retention.is_empty() or not retention.retention_enabled:
         logging.info("validate_immutability6")
-        unit = existing_unit
         values = {key: existing_retention[key] for key in _RETENTION_KEYS}
     else:
-        unit = retention.unit
-        values = {key: getattr(retention, f"{key}_{unit}") for key in _RETENTION_KEYS}
-        missing = [key for key in _RETENTION_KEYS if values[key] is None]
-        if missing and unit == existing_unit:
-            # attribut non resaisi : on garde la valeur déjà en base, même unité
-            for key in missing:
+        values = {key: retention.in_days(key) for key in _RETENTION_KEYS}
+        for key in _RETENTION_KEYS:
+            if values[key] is None:
                 values[key] = bucket[f"retention_{key}"]
-        elif missing:
-            logging.info("validate_immutability7")
-            errors.append(
-                f"Retention is currently set in {existing_unit}. Switching to {unit} requires "
-                f"default, minimum and maximum to be submitted together."
-            )
-            return
 
     default, minimum, maximum = values["default"], values["minimum"], values["maximum"]
 
     if default is None or minimum is None or maximum is None:
-        logging.info("validate_immutability8")
+        logging.info("validate_immutability7")
         errors.append(
             "Retention configuration is not valid. You must set default, minimum and maximum "
             "in the same unit, either in days or in years."
         )
         return
 
-    check_retention_bounds(unit, default, minimum, maximum, errors)
+    check_retention_bounds(DAYS, default, minimum, maximum, errors)
 
     existing_immutability["retention"] = {
         "retention_enabled": True,
-        "unit": unit,
         "default": default,
         "minimum": minimum,
         "maximum": maximum,
     }
-    logging.info(f"validate_immutability9 : {existing_immutability}")
+    logging.info(f"validate_immutability8 : {existing_immutability}")
 
 
 def validate_immutability(

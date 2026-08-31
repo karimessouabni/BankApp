@@ -1,7 +1,7 @@
 from datetime import date
 
 from dateutil.relativedelta import relativedelta
-from pydantic import BaseModel, root_validator
+from pydantic import BaseModel, model_validator
 
 MAX_RETENTION_YEARS = 5
 
@@ -11,6 +11,12 @@ _UNITS = (DAYS, YEARS)
 _KEYS = ("default", "minimum", "maximum")
 
 
+def years_to_days(years: int, start: date | None = None) -> int:
+    """Équivalent exact en jours de `years` années à partir de `start` (bissextiles comprises)."""
+    start = start or date.today()
+    return (start + relativedelta(years=years) - start).days
+
+
 def max_retention_days(start: date | None = None) -> int:
     """Nombre exact de jours dans 5 ans à partir de `start` (bissextiles comprises).
 
@@ -18,8 +24,7 @@ def max_retention_days(start: date | None = None) -> int:
     date de la demande : la même saisie en jours peut donc être acceptée un
     jour et refusée un autre, à un jour près.
     """
-    start = start or date.today()
-    return (start + relativedelta(years=MAX_RETENTION_YEARS) - start).days
+    return years_to_days(MAX_RETENTION_YEARS, start)
 
 
 def max_retention(unit: str) -> int:
@@ -46,8 +51,11 @@ class BucketRetention(BaseModel):
         return None
 
     # ── 1. Auto-enable si un paramètre est fourni sans le flag ───────────
-    @root_validator(pre=True)
-    def _auto_enable_retention(cls, values: dict) -> dict:
+    @model_validator(mode="before")
+    @classmethod
+    def _auto_enable_retention(cls, values):
+        if not isinstance(values, dict):
+            return values
         retention_flag_given = "retention_enabled" in values
         any_retention_param = any(
             values.get(f"{k}_{unit}") is not None
@@ -59,8 +67,11 @@ class BucketRetention(BaseModel):
         return values
 
     # ── 2. Une seule unité pour tout le bloc + valeurs positives ─────────
-    @root_validator(pre=True)
-    def _single_unit(cls, values: dict) -> dict:
+    @model_validator(mode="before")
+    @classmethod
+    def _single_unit(cls, values):
+        if not isinstance(values, dict):
+            return values
         used = [unit for unit in _UNITS
                 if any(values.get(f"{k}_{unit}") is not None for k in _KEYS)]
         if len(used) > 1:
@@ -76,16 +87,14 @@ class BucketRetention(BaseModel):
         return values
 
     # ── 3. Cohérence min ≤ default ≤ max et plafond 5 ans ────────────────
-    @root_validator(skip_on_failure=True)
-    def _check_bounds(cls, values: dict) -> dict:
-        unit = cls._unit_of(values.get)
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "BucketRetention":
+        unit = self.unit
         if unit is None:
-            return values
+            return self
 
         limit = max_retention(unit)
-        mn = values.get(f"minimum_{unit}")
-        df = values.get(f"default_{unit}")
-        mx = values.get(f"maximum_{unit}")
+        mn, df, mx = self.minimum, self.default, self.maximum
 
         for name, v in (("minimum", mn), ("default", df), ("maximum", mx)):
             if v is not None and v > limit:
@@ -100,9 +109,9 @@ class BucketRetention(BaseModel):
                 raise ValueError("default < minimum")
             if mx is not None and df > mx:
                 raise ValueError("default > maximum")
-        return values
+        return self
 
-    # ── Lecture : l'unité saisie et les valeurs brutes, sans conversion ──
+    # ── Lecture : l'unité saisie et les valeurs brutes ───────────────────
     @property
     def unit(self) -> str | None:
         return self._unit_of(lambda name: getattr(self, name))
@@ -128,6 +137,13 @@ class BucketRetention(BaseModel):
         """Plafond applicable dans l'unité saisie : 5 années, ou leur équivalent en jours."""
         unit = self.unit
         return max_retention(unit) if unit else None
+
+    def in_days(self, key: str) -> int | None:
+        """Valeur de l'attribut normalisée en jours, quelle que soit l'unité saisie."""
+        value = self._value(key)
+        if value is None:
+            return None
+        return value if self.unit == DAYS else years_to_days(value)
 
     def __iter__(self):
         yield "unit", self.unit
