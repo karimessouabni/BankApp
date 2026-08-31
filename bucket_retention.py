@@ -66,49 +66,49 @@ class BucketRetention(BaseModel):
             values["retention_enabled"] = True
         return values
 
-    # ── 2. Une seule unité pour tout le bloc + valeurs positives ─────────
-    @model_validator(mode="before")
-    @classmethod
-    def _single_unit(cls, values):
-        if not isinstance(values, dict):
-            return values
+    # ── 2. Tous les contrôles du payload, erreurs accumulées ─────────────
+    # Un seul validateur "after" qui n'échoue qu'à la fin : le client reçoit
+    # la liste complète des problèmes de son payload en une seule réponse.
+    @model_validator(mode="after")
+    def _validate(self) -> "BucketRetention":
+        errors = []
+
         used = [unit for unit in _UNITS
-                if any(values.get(f"{k}_{unit}") is not None for k in _KEYS)]
+                if any(getattr(self, f"{k}_{unit}") is not None for k in _KEYS)]
         if len(used) > 1:
-            raise ValueError(
+            errors.append(
                 "retention: saisir les trois attributs en jours (…_days) OU en années "
                 "(…_years), jamais un mélange des deux"
             )
+
         for k in _KEYS:
             for unit in _UNITS:
-                v = values.get(f"{k}_{unit}")
-                if v is not None and int(v) <= 0:
-                    raise ValueError(f"{k}_{unit} doit être > 0")
-        return values
+                v = getattr(self, f"{k}_{unit}")
+                if v is not None and v <= 0:
+                    errors.append(f"{k}_{unit} doit être > 0")
 
-    # ── 3. Cohérence min ≤ default ≤ max et plafond 5 ans ────────────────
-    @model_validator(mode="after")
-    def _check_bounds(self) -> "BucketRetention":
-        unit = self.unit
-        if unit is None:
-            return self
+        # Bornes et plafond : seulement quand l'unité est non ambiguë.
+        if len(used) == 1:
+            unit = used[0]
+            limit = max_retention(unit)
+            mn, df, mx = self.minimum, self.default, self.maximum
 
-        limit = max_retention(unit)
-        mn, df, mx = self.minimum, self.default, self.maximum
+            for name, v in (("minimum", mn), ("default", df), ("maximum", mx)):
+                if v is not None and v > limit:
+                    errors.append(
+                        f"{name}_{unit} dépasse {limit} {unit} "
+                        f"({MAX_RETENTION_YEARS} ans maximum, années bissextiles comprises)"
+                    )
+            if mn is not None and mx is not None and mn > mx:
+                errors.append("minimum > maximum")
+            if df is not None:
+                if mn is not None and df < mn:
+                    errors.append("default < minimum")
+                if mx is not None and df > mx:
+                    errors.append("default > maximum")
 
-        for name, v in (("minimum", mn), ("default", df), ("maximum", mx)):
-            if v is not None and v > limit:
-                raise ValueError(
-                    f"{name}_{unit} dépasse {limit} {unit} "
-                    f"({MAX_RETENTION_YEARS} ans maximum, années bissextiles comprises)"
-                )
-        if mn is not None and mx is not None and mn > mx:
-            raise ValueError("minimum > maximum")
-        if df is not None:
-            if mn is not None and df < mn:
-                raise ValueError("default < minimum")
-            if mx is not None and df > mx:
-                raise ValueError("default > maximum")
+        if errors:
+            raise ValueError(" | ".join(errors))
         return self
 
     # ── Lecture : l'unité saisie et les valeurs brutes ───────────────────
