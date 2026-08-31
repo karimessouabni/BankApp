@@ -231,6 +231,23 @@ def _backup_requested(backup) -> bool:
     return bool(backup and not backup.is_empty() and backup.backup_enabled)
 
 
+def check_backup_allowed(backup, retention_enabled, versioning_enabled, errors) -> None:
+    """Chaîne d'incompatibilités du backup, exprimée une seule fois.
+
+    Le backup exige le versioning, et la rétention exclut le versioning :
+    un bucket en rétention ne peut donc jamais recevoir de backup.
+    """
+    if not _backup_requested(backup):
+        return
+    if retention_enabled:
+        errors.append(
+            "Retention and bucket backup are not compatible. "
+            "We cannot activate backup when retention is enabled."
+        )
+    elif not versioning_enabled:
+        errors.append("Bucket backup requires object versioning to be enabled.")
+
+
 def _apply_versioning_only_update(existing_immutability: dict, enable_versioning) -> None:
     """Choix NONE : seule la bascule de versioning est appliquée, le reste est conservé."""
     if enable_versioning is None:
@@ -274,11 +291,7 @@ def _new_retention_immutability(payload_retention, enable_versioning, backup, im
             "Retention and versioning are not compatible. "
             "We cannot activate both of them simultaneously."
         )
-    if _backup_requested(backup):
-        errors.append(
-            "Retention and bucket backup are not compatible. "
-            "We cannot activate backup when retention is enabled."
-        )
+    check_backup_allowed(backup, retention_enabled=True, versioning_enabled=False, errors=errors)
     if not _retention_requested(payload_retention):
         errors.append("Retention must not be empty.")
 
@@ -342,6 +355,14 @@ def compute_bucket_new_immutability(
         _apply_versioning_only_update(immutability, enable_versioning)
 
     if _backup_requested(backup):
+        errors = []
+        check_backup_allowed(
+            backup,
+            retention_enabled=immutability["retention"]["retention_enabled"],
+            versioning_enabled=immutability["object_versioning_enabled"],
+            errors=errors,
+        )
+        raise_on_errors(errors)
         immutability = compute_bucket_backup(immutability, backup)
 
     logging.info(f"compute_bucket_new_immutability : {immutability}")
@@ -388,12 +409,8 @@ def _update_retention_bucket(
     if enable_versioning:
         errors.append("Enabling versioning is not possible when retention is already enabled.")
 
-    if _backup_requested(backup):
-        errors.append(
-            "Retention and bucket backup are not compatible. "
-            "We cannot activate backup when retention is enabled."
-        )
-
+    # L'incompatibilité backup/rétention est portée par le check central
+    # de validate_immutability_for_update_bucket, sur la même liste d'erreurs.
     validate_retention_update(retention, bucket, existing_immutability, errors)
 
 
@@ -460,15 +477,17 @@ def validate_immutability_for_update_bucket(
             errors,
         )
 
+    check_backup_allowed(
+        backup,
+        retention_enabled=existing_immutability["retention"]["retention_enabled"],
+        versioning_enabled=existing_immutability["object_versioning_enabled"],
+        errors=errors,
+    )
     raise_on_errors(errors)
 
     # Le backup s'applique exactement une fois : le chemin "bucket vierge"
     # (existing_choice is None) l'a déjà appliqué via compute_bucket_new_immutability.
-    if (
-        existing_choice is not None
-        and _backup_requested(backup)
-        and (immutability_choice == Immutability.NONE or existing_choice == Immutability.OBJECT_LOCK)
-    ):
+    if existing_choice is not None and _backup_requested(backup):
         logging.info(f"validate_immutability14 : {backup}")
         existing_immutability = compute_bucket_backup(existing_immutability, backup)
 
