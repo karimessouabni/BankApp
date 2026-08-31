@@ -1,29 +1,16 @@
-from datetime import date
+import logging
 
-from dateutil.relativedelta import relativedelta
-
-# Mêmes constantes et helpers que bucket_retention.py — à importer depuis le
-# modèle une fois le snippet recollé dans le vrai projet.
-MAX_RETENTION_YEARS = 5
-
-DAYS = "days"
-YEARS = "years"
-
-
-def years_to_days(years, start: date | None = None) -> int:
-    """Équivalent exact en jours de `years` années à partir de `start` (bissextiles comprises)."""
-    start = start or date.today()
-    return (start + relativedelta(years=years) - start).days
-
-
-def max_retention_days(start: date | None = None) -> int:
-    """Nombre exact de jours dans 5 ans à partir de `start` (bissextiles comprises)."""
-    return years_to_days(MAX_RETENTION_YEARS, start)
-
-
-def max_retention(unit) -> int:
-    """Plafond dans l'unité saisie : 5 années, ou leur équivalent exact en jours."""
-    return MAX_RETENTION_YEARS if unit == YEARS else max_retention_days()
+# Adapter le chemin d'import au vrai projet (ex. cos_service.models.bucket_retention).
+# DeclineDemandException vient du framework applicatif.
+from bucket_retention import (
+    DAYS,
+    MAX_RETENTION_YEARS,
+    YEARS,
+    BucketRetention,
+    max_retention,
+    max_retention_days,
+    years_to_days,
+)
 
 _RETENTION_KEYS = ("default", "minimum", "maximum")
 _OBJECT_LOCK_LABEL = "Object lock retention"
