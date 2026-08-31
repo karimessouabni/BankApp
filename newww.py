@@ -134,11 +134,10 @@ def compute_bucket_object_lock(
 def compute_bucket_retention(retention: BucketRetention, immutability: dict) -> dict:
     """Valide la rétention saisie et la reporte dans immutability["retention"].
 
-    Le modèle garantit déjà une unité unique ; ici on exige les trois attributs
-    et on applique min ≤ default ≤ max ainsi que le plafond de 5 ans, dans
-    l'unité saisie. La sortie reprend la forme d'origine : default / minimum /
-    maximum en nombre de jours, calculés depuis les days ou les years saisis
-    (conversion calendaire, bissextiles comprises).
+    Les règles de payload (unité unique, valeurs > 0, min ≤ default ≤ max,
+    plafond 5 ans bissextiles comprises) sont déjà garanties par les validateurs
+    du modèle : un BucketRetention invalide ne peut pas exister. Ici on n'exige
+    que la complétude — les trois attributs — puis on normalise en jours.
     """
     unit = retention.unit
     default, minimum, maximum = retention.default, retention.minimum, retention.maximum
@@ -149,10 +148,6 @@ def compute_bucket_retention(retention: BucketRetention, immutability: dict) -> 
             "Retention configuration is not valid. You must set default, minimum and maximum "
             "in the same unit, either in days (…_days) or in years (…_years)."
         )
-
-    errors = []
-    check_retention_bounds(unit, default, minimum, maximum, errors)
-    raise_on_errors(errors)
 
     immutability["retention"]["retention_enabled"] = retention.retention_enabled
     for key in _RETENTION_KEYS:
