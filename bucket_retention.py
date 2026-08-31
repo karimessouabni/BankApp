@@ -1,17 +1,30 @@
+from datetime import date
+
+from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, root_validator
 
-DAYS_PER_YEAR = 365
 MAX_RETENTION_YEARS = 5
-MAX_RETENTION_DAYS = MAX_RETENTION_YEARS * DAYS_PER_YEAR  # 1825
 
 DAYS = "days"
 YEARS = "years"
 _UNITS = (DAYS, YEARS)
 _KEYS = ("default", "minimum", "maximum")
 
-# Plafond métier exprimé dans chaque unité : aucune conversion n'est faite,
-# la valeur saisie est comparée telle quelle puis transmise telle quelle à COS.
-MAX_RETENTION = {DAYS: MAX_RETENTION_DAYS, YEARS: MAX_RETENTION_YEARS}
+
+def max_retention_days(start: date | None = None) -> int:
+    """Nombre exact de jours dans 5 ans à partir de `start` (bissextiles comprises).
+
+    1826 ou 1827 selon le nombre de 29 février dans la fenêtre. Calculé à la
+    date de la demande : la même saisie en jours peut donc être acceptée un
+    jour et refusée un autre, à un jour près.
+    """
+    start = start or date.today()
+    return (start + relativedelta(years=MAX_RETENTION_YEARS) - start).days
+
+
+def max_retention(unit: str) -> int:
+    """Plafond dans l'unité saisie : 5 années, ou leur équivalent exact en jours."""
+    return MAX_RETENTION_YEARS if unit == YEARS else max_retention_days()
 
 
 class BucketRetention(BaseModel):
@@ -69,7 +82,7 @@ class BucketRetention(BaseModel):
         if unit is None:
             return values
 
-        limit = MAX_RETENTION[unit]
+        limit = max_retention(unit)
         mn = values.get(f"minimum_{unit}")
         df = values.get(f"default_{unit}")
         mx = values.get(f"maximum_{unit}")
@@ -78,7 +91,7 @@ class BucketRetention(BaseModel):
             if v is not None and v > limit:
                 raise ValueError(
                     f"{name}_{unit} dépasse {limit} {unit} "
-                    f"({MAX_RETENTION_YEARS} ans maximum)"
+                    f"({MAX_RETENTION_YEARS} ans maximum, années bissextiles comprises)"
                 )
         if mn is not None and mx is not None and mn > mx:
             raise ValueError("minimum > maximum")
@@ -112,9 +125,9 @@ class BucketRetention(BaseModel):
 
     @property
     def max_allowed(self) -> int | None:
-        """Plafond applicable dans l'unité saisie : 1825 jours ou 5 années."""
+        """Plafond applicable dans l'unité saisie : 5 années, ou leur équivalent en jours."""
         unit = self.unit
-        return MAX_RETENTION[unit] if unit else None
+        return max_retention(unit) if unit else None
 
     def __iter__(self):
         yield "unit", self.unit

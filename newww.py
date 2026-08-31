@@ -1,16 +1,24 @@
-# 1 an = 365 jours par convention (comme l'object lock S3/COS) : le plafond est
-# une constante, pas un calendrier. La fenêtre de rétention démarre à l'écriture
-# de chaque objet, pas à la création du bucket, donc il n'existe pas de "nombre
-# exact de jours pour 5 ans" à la date de la demande.
-# Mêmes constantes que bucket_retention.py — à importer depuis le modèle
-# une fois le snippet recollé dans le vrai projet.
-DAYS_PER_YEAR = 365
+from datetime import date
+
+from dateutil.relativedelta import relativedelta
+
+# Mêmes constantes et helpers que bucket_retention.py — à importer depuis le
+# modèle une fois le snippet recollé dans le vrai projet.
 MAX_RETENTION_YEARS = 5
-MAX_RETENTION_DAYS = MAX_RETENTION_YEARS * DAYS_PER_YEAR  # 1825
 
 DAYS = "days"
 YEARS = "years"
-MAX_RETENTION = {DAYS: MAX_RETENTION_DAYS, YEARS: MAX_RETENTION_YEARS}
+
+
+def max_retention_days(start: date | None = None) -> int:
+    """Nombre exact de jours dans 5 ans à partir de `start` (bissextiles comprises)."""
+    start = start or date.today()
+    return (start + relativedelta(years=MAX_RETENTION_YEARS) - start).days
+
+
+def max_retention(unit) -> int:
+    """Plafond dans l'unité saisie : 5 années, ou leur équivalent exact en jours."""
+    return MAX_RETENTION_YEARS if unit == YEARS else max_retention_days()
 
 _RETENTION_KEYS = ("default", "minimum", "maximum")
 _OBJECT_LOCK_LABEL = "Object lock retention"
@@ -19,10 +27,10 @@ _OBJECT_LOCK_FIELDS = ("object_lock_duration_days", "object_lock_duration_years"
 
 # ── Briques communes create / update ─────────────────────────────────────
 def format_limit(unit) -> str:
-    """Plafond lisible dans l'unité saisie : "5 years" ou "5 years (1825 days)"."""
+    """Plafond lisible dans l'unité saisie : "5 years" ou "5 years (1826 days)"."""
     if unit == YEARS:
         return f"{MAX_RETENTION_YEARS} years"
-    return f"{MAX_RETENTION_YEARS} years ({MAX_RETENTION_DAYS} days)"
+    return f"{MAX_RETENTION_YEARS} years ({max_retention_days()} days)"
 
 
 def check_single_unit(days, years, label, days_field, years_field, errors) -> str | None:
@@ -47,7 +55,7 @@ def check_duration_bounds(unit, duration, label, errors) -> None:
         logging.info(f"check_duration_bounds {label} zero")
         errors.append(f"{label} ({duration} {unit}) cannot be inferior or equal to ZERO.")
 
-    if duration > MAX_RETENTION[unit]:
+    if duration > max_retention(unit):
         logging.info(f"check_duration_bounds {label} limit")
         errors.append(
             f"{label} ({duration} {unit}) cannot be superior to {format_limit(unit)}."
@@ -89,7 +97,7 @@ def check_retention_bounds(unit, default, minimum, maximum, errors) -> None:
             f"({minimum} {unit}) nor superior or equal to maximum ({maximum} {unit})."
         )
 
-    if maximum > MAX_RETENTION[unit] or maximum <= default:
+    if maximum > max_retention(unit) or maximum <= default:
         logging.info("check_retention_bounds3")
         errors.append(
             f"Retention maximum ({maximum} {unit}) cannot be inferior or equal to default "
@@ -131,32 +139,34 @@ def compute_bucket_object_lock(
     return immutability
 
 
-def compute_bucket_retention(retention, immutability: dict, operation: str) -> dict:
-    errors = []
+def compute_bucket_retention(retention: BucketRetention, immutability: dict) -> dict:
+    """Valide la rétention saisie et la reporte dans immutability["retention"].
 
+    Le modèle garantit déjà une unité unique ; ici on exige les trois attributs
+    et on applique min ≤ default ≤ max ainsi que le plafond de 5 ans, dans
+    l'unité saisie. Aucune conversion : les champs du modèle sont recopiés tels
+    quels, l'unité non utilisée reste à None.
+    """
     unit = retention.unit
-    values = {key: getattr(retention, f"{key}_{unit}") if unit else None
-              for key in _RETENTION_KEYS}
-    default, minimum, maximum = values["default"], values["minimum"], values["maximum"]
+    default, minimum, maximum = retention.default, retention.minimum, retention.maximum
 
-    if default is None or minimum is None or maximum is None:
+    if None in (unit, default, minimum, maximum):
         logging.info("compute_bucket_retention1")
-        errors.append(
+        raise DeclineDemandException(
             "Retention configuration is not valid. You must set default, minimum and maximum "
             "in the same unit, either in days (…_days) or in years (…_years)."
         )
-    else:
-        check_retention_bounds(unit, default, minimum, maximum, errors)
 
+    errors = []
+    check_retention_bounds(unit, default, minimum, maximum, errors)
     raise_on_errors(errors)
 
-    # Aucune conversion : seule l'unité saisie est renseignée, l'autre reste à None.
     immutability["retention"]["retention_enabled"] = retention.retention_enabled
     for key in _RETENTION_KEYS:
-        immutability["retention"][f"{key}_days"] = values[key] if unit == DAYS else None
-        immutability["retention"][f"{key}_years"] = values[key] if unit == YEARS else None
+        for u in (DAYS, YEARS):
+            immutability["retention"][f"{key}_{u}"] = getattr(retention, f"{key}_{u}")
 
-    logging.info(f"compute_bucket_retention2 {immutability} for operation {operation}")
+    logging.info(f"compute_bucket_retention2 {immutability}")
     return immutability
 
 
