@@ -11,4 +11,6 @@ IAM_TOKEN=$(curl -s -X POST "https://iam.cloud.ibm.com/identity/token" \
 # 2. List objects
 curl -s "${COS_ENDPOINT}/${BUCKET}?list-type=2" \
   -H "Authorization: Bearer ${IAM_TOKEN}"
+curl -s "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud/bu002i012826?list-type=2&prefix=0DD0/" \
+  -H "Authorization: Bearer $TOKEN"
 
