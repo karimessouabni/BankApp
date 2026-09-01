@@ -14,3 +14,12 @@ curl -s "${COS_ENDPOINT}/${BUCKET}?list-type=2" \
 curl -s "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud/bu002i012826?list-type=2&prefix=0DD0/" \
   -H "Authorization: Bearer $TOKEN"
 
+
+
+curl -s -X PUT "${COS_ENDPOINT}/${BUCKET}/mon-fichier.txt" \
+  --aws-sigv4 "aws:amz:${REGION}:s3" \
+  --user "${ACCESS_KEY}:${SECRET_KEY}" \
+  -T ./mon-fichier.txt
+
+
+
