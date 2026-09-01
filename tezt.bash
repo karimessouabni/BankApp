@@ -23,3 +23,13 @@ curl -s -X PUT "${COS_ENDPOINT}/${BUCKET}/mon-fichier.txt" \
 
 
 
+ACCESS_KEY="18351fec6288463e912ca1ccd3d3c6d2"
+SECRET_KEY="758f92717432374aa45ee8e17cc9760ddf19be7d05c21253"
+
+curl -s -w '\nHTTP: %{http_code}\n' \
+  "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud/bu002i012826?list-type=2&max-keys=5" \
+  --aws-sigv4 "aws:amz:eu-fr2:s3" \
+  --user "${ACCESS_KEY}:${SECRET_KEY}"
+
+
+
