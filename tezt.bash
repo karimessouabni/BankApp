@@ -48,3 +48,17 @@ curl -s -w '\nHTTP: %{http_code}\n' -X PUT \
 
 
 
+ACCESS_KEY="18351fec6288463e912ca1ccd3d3c6d2"
+SECRET_KEY="758f92717432374aa45ee8e17cc9760ddf19be7d05c21253"
+ENDPOINT="https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET="bu002i012826"
+OBJECT="0DD0/HR_RLV_20250912_02202000.txt"
+
+curl -s -w '\nHTTP: %{http_code}\n' \
+  "${ENDPOINT}/${BUCKET}/${OBJECT}" \
+  --aws-sigv4 "aws:amz:eu-fr2:s3" \
+  --user "${ACCESS_KEY}:${SECRET_KEY}" \
+  -o ./HR_RLV_20250912_02202000.txt
+
+
+
