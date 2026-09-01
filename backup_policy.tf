@@ -1,26 +1,33 @@
-# ── Backup policy : nommage unique et recréation sûre ────────────────────────
-# À recoller dans le main.tf racine du workspace bucket, en remplacement du
-# bloc backup_policies au nom en dur "backup-policy".
+# ── Backup policy : nommage unique, compatible avec le for_each du module ────
 #
-# Contexte du bug corrigé : les backup policies COS ne sont pas modifiables,
-# leur suppression n'est pas instantanée (recovery ranges), et un bucket
-# n'accepte qu'une seule policy. Recréer une policy sous le même nom pendant
-# que l'ancienne se supprime fait retomber sur l'ancienne — et sur son ancien
-# initial_delete_after_days.
+# Pourquoi pas un nom en dur : les policies COS sont immuables, leur
+# suppression n'est pas instantanée, et un bucket n'accepte qu'une policy.
+# Recréer sous le même nom pendant que l'ancienne se supprime fait retomber
+# sur l'ancienne (et son ancien initial_delete_after_days).
 #
-# Ce fichier règle la moitié Terraform (nom unique par (re)création). L'autre
-# moitié vit dans le DAG : entre la suppression et la recréation, attendre la
-# disparition effective de la policy (GET des policies du bucket jusqu'à liste
-# vide, avec timeout), comme pour wait_for_scheduled_time.
+# Pourquoi pas random_id directement : le module cle son for_each sur
+# policy_name (main.tf:456) et les CLÉS d'un for_each doivent être connues au
+# plan ; random_id.hex n'est créé qu'à l'apply → "Invalid for_each argument".
+#
+# D'où les deux fixes ci-dessous. Le 1 est recommandé : le module utilisé est
+# la copie locale du projet (../modules/terraform-module-cos), la ligne est
+# modifiable. Dans les deux cas, le DAG doit attendre la suppression effective
+# de l'ancienne policy (GET des policies jusqu'à liste vide) avant de recréer.
+
+# ── Fix 1 (recommandé) : clé statique dans le module, nom aléatoire conservé ─
+# Dans ../modules/terraform-module-cos/main.tf ligne 456, remplacer la clé par
+# l'index de la liste, connu au plan :
+#
+#   for_each = var.create_cos_bucket ? { for i, policy in var.backup_policies : i => policy } : {}
+#
+# (Avec une seule policy par bucket, l'index 0 est stable.) Le random_id
+# ci-dessous fonctionne alors tel quel : nouveau nom à chaque changement de
+# durée ou de vault, aucune collision avec une policy en cours de suppression.
 
 resource "random_id" "backup_policy" {
   count       = var.backup_enabled ? 1 : 0
   byte_length = 3
 
-  # Le suffixe est stable tant que ces valeurs ne changent pas ; changer la
-  # durée ou le vault produit un nouveau nom, donc une nouvelle policy —
-  # cohérent avec leur immuabilité côté COS, et plus aucune collision avec
-  # une ancienne policy en cours de suppression.
   keepers = {
     bucket = module.naming_bucket.name
     days   = var.initial_delete_after_days
@@ -38,11 +45,22 @@ locals {
   ]
 }
 
-# Dans le bloc module "bucket" du main.tf racine :
+# ── Fix 2 (sans toucher au module) : nom déterministe, connu au plan ────────
+# Le nom encode la durée : changer 3 -> 9 change le nom, donc destroy + create
+# de la policy. Limite : une recréation À DURÉE ÉGALE après une suppression
+# manuelle reprend le même nom — l'attente de suppression côté DAG devient
+# alors le seul rempart contre la collision.
+#
+# locals {
+#   backup_policies = !var.backup_enabled ? [] : [
+#     {
+#       policy_name               = "${module.naming_bucket.name}-bp-${var.initial_delete_after_days}d"
+#       target_backup_vault_crn   = var.target_backup_vault_crn
+#       initial_delete_after_days = var.initial_delete_after_days
+#     }
+#   ]
+# }
+
+# Branchement dans le bloc module "bucket" du main.tf racine :
 #   backup_policies = local.backup_policies
-#
-# Provider requis (versions.tf) :
-#   random = { source = "hashicorp/random" }
-#
-# Si le nom risque de dépasser la limite du champ policy_name, tronquer :
-#   substr("${module.naming_bucket.name}-bp-${random_id.backup_policy[0].hex}", 0, N)
+# Provider requis (versions.tf) : random = { source = "hashicorp/random" }
