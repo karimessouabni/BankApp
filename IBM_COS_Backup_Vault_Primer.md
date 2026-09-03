@@ -64,6 +64,30 @@ Cross-account: the authorization is created **in the account that owns the targe
 - Terraform/Schematics or Airflow service IDs need: Backup Manager on the vault instance + Manager on source buckets + Writer on target buckets.
 - Strongest isolation: vault in a separate account where the production account holds **only** the backup service-to-service authorization and no human Backup Manager role.
 
+
+## 7. Object Lock vs. Backup Vault: what the vault protects against that Object Lock does not
+
+Object Lock protects **object versions inside the bucket**. Backup Vault protects **the state of the bucket, outside the bucket**. They answer different questions:
+
+- Object Lock: *"nobody can delete this version here."*
+- Backup Vault: *"even if here disappears, I can rebuild the bucket as it was at time T."*
+
+| Risk | Object Lock | Backup Vault |
+|---|---|---|
+| Unlocked objects (written without retention, no bucket default) | Not protected — deletable like any object | Everything that transits through the bucket is captured |
+| Retention period expires | Protection ends on day N+1 | Independent retention, extendable on the vault |
+| Governance mode bypass (`bypass_governance_retention`) | A compromised identity with this right can shorten or remove locks | Vault is untouched; only Compliance mode is truly tamper-proof |
+| COS instance deleted / account closed | Versions are locked, but the container is gone (reclamation, then permanent loss) | Cross-account vault survives |
+| Encryption key (Key Protect / HPCS) deleted or destructively rotated | Objects exist but are unreadable | Vault has its own key |
+| Regional outage | No replication — data unavailable, locked or not | Cross-region vault is a physical copy elsewhere |
+| Mass overwrite / delete (ransomware, bad script) | Old versions exist, but must be found and re-promoted one by one | One operation restores the whole bucket at instant T — a real RTO |
+
+**What the vault does not cover better:** data corrupted before being written is corrupted in both. With Compliance mode, long retention, same account and no regional constraint, the gain narrows to unlocked objects, container/key loss and consistent restore.
+
+**Bottom line:** Object Lock is immutability, Backup Vault is a backup. A robust design uses both: versioning + Object Lock on the source, plus a cross-account, cross-region vault.
+
+
+
 ## 5. Things to remember
 
 - A vault behaves like a **write-once ledger of a bucket's history**, not like a second bucket you can browse or edit.
@@ -87,6 +111,11 @@ Also checked at policy creation: the source bucket must have fewer than 3 backup
 - **On an existing bucket**: `PUT Bucket?versioning` (S3 API) or `ibmcloud cos bucket-versioning-put --bucket <name> --versioning-configuration '{"Status":"Enabled"}'`. Existing objects become the "current" version; history starts from that moment.
 - Versioning can only be **Enabled** or **Suspended** — it can never be fully disabled. To remove it, you must migrate the data to a new, non-versioned bucket.
 - Check the state with `GET Bucket?versioning` — this is exactly what the backup service validates.
+
+
+
+
+
 
 ### The trap: retention policies (Immutable Object Storage) vs. Object Lock
 
