@@ -70,5 +70,41 @@ Cross-account: the authorization is created **in the account that owns the targe
 - Restore is a **copy** into a bucket; it never touches the vault. Time to restore scales with the volume of data.
 - Deleting a policy stops the sync but does not delete the backup data: retention decides when it goes.
 - Cross-region + cross-account vault + Key Protect encryption = the strongest isolation posture.
+## 6. Versioning is the foundation: source and target buckets
 
+Backup Vault does not work on a bucket that is not versioned. Versioning is a hard prerequisite on **both sides** of the flow:
+
+| Bucket | Why versioning is required |
+|---|---|
+| **Source bucket** | The `BackupPolicy` creation is rejected (HTTP 400) if the bucket does not have versioning enabled. The continuous sync relies on object versions to know exactly which object state existed at any instant — without version history, "restore to any point in time" is impossible. |
+| **Target bucket** | A Restore is rejected if the target is not versioned. Restored objects are written as new versions, so the restore never destroys what is already in the bucket and can itself be rolled back. |
+
+Also checked at policy creation: the source bucket must have fewer than 3 backup policies, and no two policies with the same name or the same target vault.
+
+### How versioning is enabled
+
+- **At bucket creation**: toggle *Object versioning* → Enabled in the console, or `object_versioning { enable = true }` in Terraform.
+- **On an existing bucket**: `PUT Bucket?versioning` (S3 API) or `ibmcloud cos bucket-versioning-put --bucket <name> --versioning-configuration '{"Status":"Enabled"}'`. Existing objects become the "current" version; history starts from that moment.
+- Versioning can only be **Enabled** or **Suspended** — it can never be fully disabled. To remove it, you must migrate the data to a new, non-versioned bucket.
+- Check the state with `GET Bucket?versioning` — this is exactly what the backup service validates.
+
+### The trap: retention policies (Immutable Object Storage) vs. Object Lock
+
+IBM COS offers two WORM mechanisms, and only one of them is compatible with Backup Vault:
+
+| Mechanism | Works with versioning? | Consequence for Backup Vault |
+|---|---|---|
+| **Retention policy** (Immutable Object Storage, "Add retention policy" on the bucket) | **No.** Enabling versioning on a bucket that has a retention policy fails, and adding a retention policy to a versioned bucket fails. Retention policies **cannot be removed** once set. | The bucket can **never** be a backup source or restore target. The only way out is to migrate the data to a new bucket. |
+| **Object Lock** (Governance / Compliance modes, legal holds) | **Yes — it requires versioning.** Object Lock protects individual object *versions*, so versioning is mandatory and must be enabled first. | Fully compatible: a bucket can be immutable **and** backed up. |
+
+### Why this matters for real protection
+
+- Versioning alone protects against accidental overwrites and deletes inside the bucket, but not against a compromised account that deletes versions or the bucket itself.
+- Backup Vault adds an **off-bucket, unmodifiable copy** with point-in-time restore — but it only exists if versioning is on.
+- Object Lock on the source bucket adds **in-bucket immutability** (versions cannot be deleted before their retain-until date, even by admins in Compliance mode).
+- The combination **versioning + Object Lock + Backup Vault (ideally cross-account)** covers the three failure modes: human error, malicious deletion, and loss of the production account.
+
+**Rule of thumb when designing a new bucket:** enable versioning at creation, use Object Lock (not a retention policy) if immutability is required, and never add a retention policy to a bucket you may want to back up or restore into.
+
+References: [Versioning objects](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-versioning) · [Object Lock](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-ol-overview) · [Restore prerequisites](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-restore)
 **References:** [Backing up your buckets](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-bvm-overview) · [Restore](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-restore)
