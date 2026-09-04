@@ -1,0 +1,35 @@
+**Changement API – création et modification de bucket**
+
+**Règle générale**
+La durée s'exprime désormais soit en années, soit en jours — jamais les deux dans le même payload. Un payload mixant `*_years` et `*_days` est rejeté.
+
+**1. Object Lock**
+
+| Champ | Statut | Plage |
+|---|---|---|
+| `object_lock_duration_years` | Nouveau, optionnel | 1 à 5 |
+| `object_lock_duration_days` | Existant, limite modifiée | 1 à 1825 (+1 par année bissextile) |
+
+**2. Retention**
+
+Ancien format (déprécié) :
+```json
+"retention": {"default": 2, "minimum": 1, "maximum": 3}
+```
+
+Nouveau format — en jours (1 à 1825, +1 par année bissextile) :
+```json
+"retention": {"default_days": 2, "minimum_days": 1, "maximum_days": 3}
+```
+
+Nouveau format — en années (1 à 5) :
+```json
+"retention": {"default_years": 2, "minimum_years": 1, "maximum_years": 3}
+```
+
+**Contraintes**
+- Choisir une seule unité par bloc (`_days` ou `_years`), pas de mélange.
+- `minimum ≤ default ≤ maximum` reste applicable.
+- Les clés sans suffixe (`default`, `minimum`, `maximum`) ne sont plus acceptées.
+
+Deux points à confirmer côté API si tu diffuses ça : le comportement exact en cas de mélange (400 ou ignoré ?), et si l'unité Object Lock doit être cohérente avec celle du bloc Retention dans un même payload.
