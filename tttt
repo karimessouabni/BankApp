@@ -2,21 +2,21 @@ from enum import Enum
 
 
 class Immutability(str, Enum):
-    RETENTION = "retention_daily"
-    OBJECT_LOCK = "object_lock"
+    RETENTION_DAILY = "retention_daily"
+    RETENTION_YEARLY = "retention_yearly"
+    OBJECT_LOCK = "object_lock"            # rétrocompat, à supprimer quand plus utilisé
+    OBJECT_LOCK_DAILY = "object_lock_daily"
+    OBJECT_LOCK_YEARLY = "object_lock_yearly"
     NONE = "none"
 
-    _ALIASES = {
-        "retention_daily": "retention_daily",
-        "retention_yearly": "retention_daily",
-        "object_lock_daily": "object_lock",
-        "object_lock_yearly": "object_lock",
-    }
+    @property
+    def is_retention(self) -> bool:
+        return self.value.startswith("retention")
 
-    @classmethod
-    def _missing_(cls, value):
-        if isinstance(value, str):
-            canonical = cls._ALIASES.value.get(value.lower())
-            if canonical is not None:
-                return cls(canonical)
-        return None
+    @property
+    def is_object_lock(self) -> bool:
+        return self.value.startswith("object_lock")
+
+    @property
+    def is_yearly(self) -> bool:
+        return self.value.endswith("_yearly")
