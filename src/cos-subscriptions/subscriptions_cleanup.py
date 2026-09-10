@@ -3,7 +3,8 @@
 Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
 
 1. GET  {base}/multireader/api/v1/subscriptions?product=<product>
-   -> pour chaque row, on regarde geninfo.demands :
+   -> on ne garde que les rows dont context.user == <user> (défaut: h90871),
+      puis pour chacune on regarde geninfo.demands :
       la souscription est "éligible" si TOUTES les demandes ont
       status == SUCCESS et action dans {force_clean, create, update}
       (donc jamais de delete, jamais d'échec, liste non vide).
@@ -15,6 +16,8 @@ Usage:
     python subscriptions_cleanup.py                       # liste seulement (dry-run)
     python subscriptions_cleanup.py --delete              # supprime réellement
     python subscriptions_cleanup.py --delete --yes        # sans confirmation
+    python subscriptions_cleanup.py --user h12345               # autre user
+    python subscriptions_cleanup.py --all-users                 # sans filtre user
     python subscriptions_cleanup.py --product cos.bucket --base-url https://...
     python subscriptions_cleanup.py --input scratch.json  # lit un JSON local au lieu du GET
 
@@ -38,6 +41,7 @@ from typing import Any, Iterable
 DEFAULT_BASE_URL = "https://orchestrator-gw.int.staging.echonet"
 DEFAULT_PRODUCT = "cos.bucket"
 DEFAULT_PRODUCT_BRANCH = "main"
+DEFAULT_USER = "h90871"
 DEFAULT_TIMEOUT = 60
 
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
@@ -55,6 +59,7 @@ class OrchestratorApiError(RuntimeError):
 class Subscription:
     subscription_id: str
     name: str = ""
+    user: str = ""
     status: str = ""
     environment: str = ""
     region: str = ""
@@ -86,11 +91,18 @@ def extract_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def find_eligible_subscriptions(body: dict[str, Any]) -> list[Subscription]:
-    """Retourne les souscriptions dont geninfo.demands ne contient que des
-    force_clean / create / update en SUCCESS."""
+def find_eligible_subscriptions(
+    body: dict[str, Any], user: str | None = DEFAULT_USER
+) -> list[Subscription]:
+    """Retourne les souscriptions dont context.user == user (None = pas de filtre)
+    et dont geninfo.demands ne contient que des force_clean / create / update
+    en SUCCESS."""
     eligible: list[Subscription] = []
     for row in extract_rows(body):
+        context = row.get("context") or {}
+        row_user = context.get("user", "")
+        if user is not None and row_user != user:
+            continue
         geninfo = row.get("geninfo") or {}
         demands = geninfo.get("demands") or []
         subscription_id = geninfo.get("subscription_id")
@@ -101,6 +113,7 @@ def find_eligible_subscriptions(body: dict[str, Any]) -> list[Subscription]:
                 Subscription(
                     subscription_id=subscription_id,
                     name=geninfo.get("name", ""),
+                    user=row_user,
                     status=geninfo.get("status", ""),
                     environment=geninfo.get("environment", ""),
                     region=geninfo.get("region", ""),
@@ -198,6 +211,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--product", default=DEFAULT_PRODUCT)
     parser.add_argument("--product-branch", default=DEFAULT_PRODUCT_BRANCH,
                         help="valeur de product_branch dans le payload DELETE")
+    parser.add_argument("--user", default=DEFAULT_USER,
+                        help=f"ne garder que les rows dont context.user vaut cette valeur (défaut: {DEFAULT_USER})")
+    parser.add_argument("--all-users", action="store_true",
+                        help="désactive le filtre sur context.user")
     parser.add_argument("--input", metavar="FILE",
                         help="lire le JSON depuis un fichier au lieu d'appeler le GET")
     parser.add_argument("--delete", action="store_true",
@@ -229,16 +246,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"GET échoué: {exc}", file=sys.stderr)
             return 2
 
+    user_filter = None if args.all_users else args.user
     total_rows = len(extract_rows(body))
-    eligible = find_eligible_subscriptions(body)
+    eligible = find_eligible_subscriptions(body, user_filter)
 
     if args.as_json and not args.delete:
         print(json.dumps([s.subscription_id for s in eligible], indent=2))
         return 0
 
-    print(f"{total_rows} souscription(s) lue(s), {len(eligible)} éligible(s) à la suppression:")
+    scope = "tous users" if user_filter is None else f"user={user_filter}"
+    print(f"{total_rows} souscription(s) lue(s), {len(eligible)} éligible(s) à la suppression ({scope}):")
     for sub in eligible:
-        print(f"  {sub.subscription_id}  {sub.name:<16} {sub.environment:<5} {sub.region:<7} "
+        print(f"  {sub.subscription_id}  {sub.name:<16} {sub.user:<12} {sub.environment:<5} {sub.region:<7} "
               f"{sub.status:<12} demands={','.join(sub.actions)}")
 
     if not args.delete or not eligible:

@@ -17,9 +17,11 @@ def _demand(action: str, status: str = "SUCCESS") -> dict:
     return {"action": action, "status": status, "status_reason": status.lower()}
 
 
-def _row(subscription_id: str, demands: list[dict], name: str = "bu003i023571") -> dict:
+def _row(subscription_id: str, demands: list[dict], name: str = "bu003i023571",
+         user: str = "h90871") -> dict:
     return {
-        "context": {"code_bu": "BP2I", "realm": "rl003i001058"},
+        "context": {"code_bu": "BP2I", "realm": "rl003i001058", "user": user,
+                    "tier": "A", "env_type": "NPR"},
         "geninfo": {
             "apcode": "A100473",
             "demands": demands,
@@ -72,6 +74,29 @@ class FindEligibleTests(unittest.TestCase):
         self.assertEqual([s.subscription_id for s in found], ["aaaa-1", "bbbb-2"])
         self.assertEqual(found[0].actions, ["create", "update"])
         self.assertEqual(found[0].name, "bu003i000001")
+
+    def test_filters_on_context_user(self):
+        body = {"result": {"rows": [
+            _row("mine-1", [_demand("create")], user="h90871"),
+            _row("other-1", [_demand("create")], user="service-account-products_cft_confidential"),
+            _row("nouser-1", [_demand("create")]),
+        ]}}
+        body["result"]["rows"][2]["context"].pop("user")
+        self.assertEqual([s.subscription_id for s in sc.find_eligible_subscriptions(body)], ["mine-1"])
+        self.assertEqual(sc.find_eligible_subscriptions(body)[0].user, "h90871")
+        self.assertEqual(
+            [s.subscription_id for s in sc.find_eligible_subscriptions(body, "service-account-products_cft_confidential")],
+            ["other-1"],
+        )
+        self.assertEqual(
+            [s.subscription_id for s in sc.find_eligible_subscriptions(body, None)],
+            ["mine-1", "other-1", "nouser-1"],
+        )
+
+    def test_cli_user_flags(self):
+        self.assertEqual(sc.parse_args([]).user, "h90871")
+        self.assertEqual(sc.parse_args(["--user", "h12345"]).user, "h12345")
+        self.assertTrue(sc.parse_args(["--all-users"]).all_users)
 
     def test_row_without_subscription_id_is_skipped(self):
         row = _row("", [_demand("create")])
