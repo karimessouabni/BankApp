@@ -13,8 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import subscriptions_cleanup as sc  # noqa: E402
 
 
-def _demand(action: str, status: str = "SUCCESS") -> dict:
-    return {"action": action, "status": status, "status_reason": status.lower()}
+def _demand(action: str, status: str = "SUCCESS", uuid: str = "", create_date: str = "") -> dict:
+    return {"action": action, "status": status, "status_reason": status.lower(),
+            "uuid": uuid or f"uuid-{action}-{status}", "create_date": create_date}
 
 
 def _row(subscription_id: str, demands: list[dict], name: str = "bu003i023571",
@@ -88,6 +89,9 @@ class FindEligibleTests(unittest.TestCase):
         self.assertEqual([s.subscription_id for s in found], ["aaaa-1", "bbbb-2", "dddd-4"])
         self.assertEqual(found[0].actions, ["create", "update"])
         self.assertEqual(found[2].actions, ["create", "delete(ERROR)"])
+        self.assertFalse(found[0].needs_retry)
+        self.assertTrue(found[2].needs_retry)
+        self.assertEqual(found[2].failed_delete_demand_ids, ["uuid-delete-ERROR"])
         self.assertEqual(found[0].name, "bu003i000001")
 
     def test_filters_on_context_user(self):
@@ -118,7 +122,66 @@ class FindEligibleTests(unittest.TestCase):
         self.assertEqual(sc.find_eligible_subscriptions({"result": {"rows": [row]}}), [])
 
 
+class RetryHelpersTests(unittest.TestCase):
+    def test_failed_delete_demand_ids_sorted_by_create_date(self):
+        demands = [
+            _demand("create"),
+            _demand("delete", "ERROR", uuid="d2", create_date="2026-09-09T19:00:00Z"),
+            _demand("delete", "ERROR", uuid="d1", create_date="2026-09-09T18:00:00Z"),
+            _demand("delete", "SUCCESS", uuid="d3"),
+        ]
+        self.assertEqual(sc.failed_delete_demand_ids(demands), ["d1", "d2"])
+
+    def test_failed_process_names(self):
+        demand = {
+            "kind": "Demand",
+            "uuid": "182e47b2-cfa2-4829-bb01-c2110a96099b",
+            "status": "IN_PROGRESS",
+            "processes": [
+                {"kind": "Process", "name": "bootstrap", "status": "SUCCESS"},
+                {"kind": "Process", "name": "validate_bucket_and_workspace", "status": "ERROR"},
+                {"kind": "Process", "name": "delete_bucket", "status": "ERROR"},
+                {"kind": "Process", "name": "notify", "status": "PENDING"},
+            ],
+        }
+        self.assertEqual(sc.failed_process_names(demand),
+                         ["validate_bucket_and_workspace", "delete_bucket"])
+        self.assertEqual(sc.failed_process_names({}), [])
+
+
 class ClientTests(unittest.TestCase):
+    def test_get_demand_url(self):
+        client = sc.OrchestratorClient("tok")
+        with mock.patch.object(client, "_request", return_value={}) as req:
+            client.get_demand("182e47b2-cfa2-4829-bb01-c2110a96099b")
+        req.assert_called_once_with("GET", "/api/v1/demands/182e47b2-cfa2-4829-bb01-c2110a96099b")
+
+    def test_retry_demand_payload(self):
+        client = sc.OrchestratorClient("tok")
+        with mock.patch.object(client, "_request", return_value={}) as req:
+            client.retry_demand("182e47b2", ["delete_bucket"])
+        req.assert_called_once_with(
+            "POST", "/api/v1/demands/182e47b2/retry",
+            {"tasks": ["delete_bucket"], "retry_non_failed_tasks": False},
+        )
+
+    def test_retry_failed_delete_end_to_end(self):
+        client = sc.OrchestratorClient("tok")
+        demand = {"processes": [{"name": "bootstrap", "status": "SUCCESS"},
+                                {"name": "delete_bucket", "status": "ERROR"}]}
+        with mock.patch.object(client, "get_demand", return_value=demand), \
+             mock.patch.object(client, "retry_demand", return_value={}) as retry:
+            self.assertEqual(client.retry_failed_delete("d1"), ["delete_bucket"])
+        retry.assert_called_once_with("d1", ["delete_bucket"])
+
+    def test_retry_failed_delete_skips_when_nothing_in_error(self):
+        client = sc.OrchestratorClient("tok")
+        demand = {"processes": [{"name": "bootstrap", "status": "SUCCESS"}]}
+        with mock.patch.object(client, "get_demand", return_value=demand), \
+             mock.patch.object(client, "retry_demand") as retry:
+            self.assertEqual(client.retry_failed_delete("d1"), [])
+        retry.assert_not_called()
+
     def test_delete_payload_and_url(self):
         client = sc.OrchestratorClient("tok", "https://orchestrator-gw.int.staging.echonet/")
         with mock.patch.object(client, "_request", return_value={"ok": True}) as req:

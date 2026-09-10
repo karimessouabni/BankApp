@@ -11,13 +11,20 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
           (status != SUCCESS) : un delete réussi rend la souscription
           non éligible,
         - la liste est non vide et ne contient pas d'autre action.
-2. DELETE {base}/apl/v1/subscriptions/<subscription_id>
-   avec le payload {"product_branch": "main", "payload": {}}.
+2. Pour chaque souscription éligible :
+   - sans delete en échec : DELETE {base}/apl/v1/subscriptions/<subscription_id>
+     avec le payload {"product_branch": "main", "payload": {}} ;
+   - avec delete(s) en échec : on relance la demande existante plutôt que
+     d'en créer une nouvelle :
+       GET  {base}/api/v1/demands/<demand_uuid>
+       -> names des processes dont status == ERROR
+       POST {base}/api/v1/demands/<demand_uuid>/retry
+            {"tasks": [<names>], "retry_non_failed_tasks": false}
 
 Usage:
     export ORCHESTRATOR_TOKEN=...            # ou --token
     python subscriptions_cleanup.py                       # liste seulement (dry-run)
-    python subscriptions_cleanup.py --delete              # supprime réellement
+    python subscriptions_cleanup.py --delete              # supprime / relance réellement
     python subscriptions_cleanup.py --delete --yes        # sans confirmation
     python subscriptions_cleanup.py --user h12345               # autre user
     python subscriptions_cleanup.py --all-users                 # sans filtre user
@@ -50,6 +57,7 @@ DEFAULT_TIMEOUT = 60
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
 DELETE_ACTION = "delete"
 SUCCESS_STATUS = "SUCCESS"
+PROCESS_ERROR_STATUS = "ERROR"
 
 
 class OrchestratorApiError(RuntimeError):
@@ -68,6 +76,11 @@ class Subscription:
     environment: str = ""
     region: str = ""
     actions: list[str] = field(default_factory=list)
+    failed_delete_demand_ids: list[str] = field(default_factory=list)
+
+    @property
+    def needs_retry(self) -> bool:
+        return bool(self.failed_delete_demand_ids)
 
 
 # --------------------------------------------------------------------------- #
@@ -100,6 +113,25 @@ def _demand_label(demand: dict[str, Any]) -> str:
     return action if status == SUCCESS_STATUS else f"{action}({status})"
 
 
+def failed_delete_demand_ids(demands: Iterable[dict[str, Any]]) -> list[str]:
+    """uuid des demandes delete non SUCCESS, dans l'ordre de create_date."""
+    failed = [
+        d for d in demands
+        if d.get("action") == DELETE_ACTION and d.get("status") != SUCCESS_STATUS and d.get("uuid")
+    ]
+    failed.sort(key=lambda d: d.get("create_date") or "")
+    return [d["uuid"] for d in failed]
+
+
+def failed_process_names(demand: dict[str, Any]) -> list[str]:
+    """names des processes en ERROR dans la réponse GET /api/v1/demands/<uuid>."""
+    processes = demand.get("processes") or []
+    return [
+        p["name"] for p in processes
+        if p.get("status") == PROCESS_ERROR_STATUS and p.get("name")
+    ]
+
+
 def extract_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
     result = body.get("result", body)
     rows = result.get("rows", [])
@@ -112,8 +144,7 @@ def find_eligible_subscriptions(
     body: dict[str, Any], user: str | None = DEFAULT_USER
 ) -> list[Subscription]:
     """Retourne les souscriptions dont context.user == user (None = pas de filtre)
-    et dont geninfo.demands ne contient que des force_clean / create / update
-    en SUCCESS."""
+    et dont geninfo.demands respecte is_eligible()."""
     eligible: list[Subscription] = []
     for row in extract_rows(body):
         context = row.get("context") or {}
@@ -135,6 +166,7 @@ def find_eligible_subscriptions(
                     environment=geninfo.get("environment", ""),
                     region=geninfo.get("region", ""),
                     actions=[_demand_label(d) for d in demands],
+                    failed_delete_demand_ids=failed_delete_demand_ids(demands),
                 )
             )
     return eligible
@@ -200,6 +232,23 @@ class OrchestratorClient:
         """DELETE /apl/v1/subscriptions/<id> avec {"product_branch": ..., "payload": {}}."""
         path = f"/apl/v1/subscriptions/{urllib.parse.quote(subscription_id, safe='')}"
         return self._request("DELETE", path, {"product_branch": product_branch, "payload": {}})
+
+    def get_demand(self, demand_id: str) -> dict[str, Any]:
+        """GET /api/v1/demands/<uuid>."""
+        return self._request("GET", f"/api/v1/demands/{urllib.parse.quote(demand_id, safe='')}")
+
+    def retry_demand(self, demand_id: str, tasks: list[str], retry_non_failed_tasks: bool = False) -> Any:
+        """POST /api/v1/demands/<uuid>/retry avec {"tasks": [...], "retry_non_failed_tasks": false}."""
+        path = f"/api/v1/demands/{urllib.parse.quote(demand_id, safe='')}/retry"
+        return self._request("POST", path, {"tasks": tasks, "retry_non_failed_tasks": retry_non_failed_tasks})
+
+    def retry_failed_delete(self, demand_id: str) -> list[str]:
+        """GET la demande, relance ses processes en ERROR. Retourne les tasks relancées
+        (liste vide si aucun process en ERROR : rien n'est envoyé)."""
+        tasks = failed_process_names(self.get_demand(demand_id))
+        if tasks:
+            self.retry_demand(demand_id, tasks)
+        return tasks
 
 
 def _try_json(raw: bytes) -> Any:
@@ -272,30 +321,47 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     scope = "tous users" if user_filter is None else f"user={user_filter}"
-    print(f"{total_rows} souscription(s) lue(s), {len(eligible)} éligible(s) à la suppression ({scope}):")
+    to_retry = [s for s in eligible if s.needs_retry]
+    to_delete = [s for s in eligible if not s.needs_retry]
+    print(f"{total_rows} souscription(s) lue(s), {len(eligible)} éligible(s) ({scope}): "
+          f"{len(to_delete)} à supprimer, {len(to_retry)} delete à relancer")
     for sub in eligible:
+        plan = f"RETRY {','.join(sub.failed_delete_demand_ids)}" if sub.needs_retry else "DELETE"
         print(f"  {sub.subscription_id}  {sub.name:<16} {sub.user:<12} {sub.environment:<5} {sub.region:<7} "
-              f"{sub.status:<12} demands={','.join(sub.actions)}")
+              f"{sub.status:<12} demands={','.join(sub.actions)}  -> {plan}")
 
     if not args.delete or not eligible:
         if eligible and not args.delete:
-            print("\nDry-run: relancer avec --delete pour supprimer.")
+            print("\nDry-run: relancer avec --delete pour exécuter.")
         return 0
 
     if client is None:
         if not args.token:
-            print("Token manquant pour les DELETE: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
+            print("Token manquant pour les DELETE/retry: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
             return 1
         client = OrchestratorClient(args.token, args.base_url, args.timeout, args.insecure)
 
     if not args.yes:
-        answer = input(f"\nSupprimer ces {len(eligible)} souscription(s) ? [y/N] ").strip().lower()
+        answer = input(f"\nExécuter {len(to_delete)} DELETE et {len(to_retry)} retry ? [y/N] ").strip().lower()
         if answer not in ("y", "yes", "o", "oui"):
             print("Annulé.")
             return 0
 
     failures = 0
     for sub in eligible:
+        if sub.needs_retry:
+            for demand_id in sub.failed_delete_demand_ids:
+                try:
+                    tasks = client.retry_failed_delete(demand_id)
+                except OrchestratorApiError as exc:
+                    failures += 1
+                    print(f"RETRY {demand_id} ({sub.name}) -> ERREUR {exc}", file=sys.stderr)
+                    continue
+                if tasks:
+                    print(f"RETRY {demand_id} ({sub.name}) -> OK tasks={','.join(tasks)}")
+                else:
+                    print(f"RETRY {demand_id} ({sub.name}) -> ignoré, aucun process en {PROCESS_ERROR_STATUS}")
+            continue
         try:
             response = client.delete_subscription(sub.subscription_id, args.product_branch)
             print(f"DELETE {sub.subscription_id} ({sub.name}) -> OK {_summ(response)}")
@@ -303,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             failures += 1
             print(f"DELETE {sub.subscription_id} ({sub.name}) -> ERREUR {exc}", file=sys.stderr)
 
-    print(f"\n{len(eligible) - failures} supprimée(s), {failures} en échec.")
+    print(f"\n{len(eligible) - failures} traitée(s), {failures} en échec.")
     return 3 if failures else 0
 
 
