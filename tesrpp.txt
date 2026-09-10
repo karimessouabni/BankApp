@@ -1,0 +1,7 @@
+python -c "
+from cos_service.models.base import Base
+import cos_service.models.Bucket, cos_service.models.BackupVault
+print('tables metadata :', sorted(Base.metadata.tables))
+from sqlalchemy import create_engine, inspect
+import os; print('tables en base   :', inspect(create_engine(os.environ['DATABASE_URL'])).get_table_names())
+"
