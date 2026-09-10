@@ -5,9 +5,12 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
 1. GET  {base}/multireader/api/v1/subscriptions?product=<product>
    -> on ne garde que les rows dont context.user == <user> (défaut: h90871),
       puis pour chacune on regarde geninfo.demands :
-      la souscription est "éligible" si TOUTES les demandes ont
-      status == SUCCESS et action dans {force_clean, create, update}
-      (donc jamais de delete, jamais d'échec, liste non vide).
+      la souscription est "éligible" si :
+        - toutes les demandes force_clean / create / update sont en SUCCESS,
+        - les demandes delete, s'il y en a, sont TOUTES en erreur
+          (status != SUCCESS) : un delete réussi rend la souscription
+          non éligible,
+        - la liste est non vide et ne contient pas d'autre action.
 2. DELETE {base}/apl/v1/subscriptions/<subscription_id>
    avec le payload {"product_branch": "main", "payload": {}}.
 
@@ -45,6 +48,7 @@ DEFAULT_USER = "h90871"
 DEFAULT_TIMEOUT = 60
 
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
+DELETE_ACTION = "delete"
 SUCCESS_STATUS = "SUCCESS"
 
 
@@ -71,16 +75,29 @@ class Subscription:
 # --------------------------------------------------------------------------- #
 
 def is_eligible(demands: Iterable[dict[str, Any]] | None) -> bool:
-    """True si toutes les demandes sont en SUCCESS et de type force_clean/create/update."""
+    """True si toutes les demandes force_clean/create/update sont en SUCCESS
+    et que les éventuelles demandes delete sont toutes en erreur (!= SUCCESS)."""
     demands = list(demands or [])
     if not demands:
         return False
     for demand in demands:
-        if demand.get("status") != SUCCESS_STATUS:
-            return False
-        if demand.get("action") not in ALLOWED_ACTIONS:
+        action = demand.get("action")
+        succeeded = demand.get("status") == SUCCESS_STATUS
+        if action in ALLOWED_ACTIONS:
+            if not succeeded:
+                return False
+        elif action == DELETE_ACTION:
+            if succeeded:
+                return False
+        else:
             return False
     return True
+
+
+def _demand_label(demand: dict[str, Any]) -> str:
+    action = demand.get("action", "?")
+    status = demand.get("status", "?")
+    return action if status == SUCCESS_STATUS else f"{action}({status})"
 
 
 def extract_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -117,7 +134,7 @@ def find_eligible_subscriptions(
                     status=geninfo.get("status", ""),
                     environment=geninfo.get("environment", ""),
                     region=geninfo.get("region", ""),
-                    actions=[d.get("action", "?") for d in demands],
+                    actions=[_demand_label(d) for d in demands],
                 )
             )
     return eligible

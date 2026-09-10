@@ -43,9 +43,22 @@ class IsEligibleTests(unittest.TestCase):
     def test_single_create(self):
         self.assertTrue(sc.is_eligible([_demand("create")]))
 
-    def test_delete_present_is_rejected(self):
-        # Cas de la capture d'écran: force_clean + create + delete -> non éligible
+    def test_successful_delete_is_rejected(self):
+        # Cas de la capture d'écran: force_clean + create + delete SUCCESS -> non éligible
         self.assertFalse(sc.is_eligible([_demand("force_clean"), _demand("create"), _demand("delete")]))
+
+    def test_failed_delete_is_accepted(self):
+        self.assertTrue(sc.is_eligible([_demand("force_clean"), _demand("create"), _demand("delete", "ERROR")]))
+        self.assertTrue(sc.is_eligible([_demand("create"), _demand("delete", "FAILED"), _demand("delete", "ERROR")]))
+
+    def test_failed_delete_with_failed_other_action_is_rejected(self):
+        self.assertFalse(sc.is_eligible([_demand("create", "ERROR"), _demand("delete", "ERROR")]))
+
+    def test_mixed_delete_statuses_is_rejected(self):
+        self.assertFalse(sc.is_eligible([_demand("create"), _demand("delete", "ERROR"), _demand("delete")]))
+
+    def test_unknown_action_is_rejected(self):
+        self.assertFalse(sc.is_eligible([_demand("create"), _demand("restore")]))
 
     def test_failed_status_is_rejected(self):
         self.assertFalse(sc.is_eligible([_demand("create"), _demand("update", "FAILED")]))
@@ -67,12 +80,14 @@ class FindEligibleTests(unittest.TestCase):
                     _row("aaaa-1", [_demand("create"), _demand("update")], name="bu003i000001"),
                     _row("bbbb-2", [_demand("force_clean"), _demand("create")], name="bu003i000002"),
                     _row("cccc-3", [_demand("create", "FAILED")], name="bu003i000003"),
+                    _row("dddd-4", [_demand("create"), _demand("delete", "ERROR")], name="bu003i000004"),
                 ],
             },
         }
         found = sc.find_eligible_subscriptions(body)
-        self.assertEqual([s.subscription_id for s in found], ["aaaa-1", "bbbb-2"])
+        self.assertEqual([s.subscription_id for s in found], ["aaaa-1", "bbbb-2", "dddd-4"])
         self.assertEqual(found[0].actions, ["create", "update"])
+        self.assertEqual(found[2].actions, ["create", "delete(ERROR)"])
         self.assertEqual(found[0].name, "bu003i000001")
 
     def test_filters_on_context_user(self):
