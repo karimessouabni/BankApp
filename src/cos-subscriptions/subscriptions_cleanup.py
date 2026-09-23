@@ -23,18 +23,15 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
        POST {base}/api/v1/demands/<demand_uuid>/retry
             {"tasks": [<names>], "retry_non_failed_tasks": false}
 
-Mode "locked" (--locked) : décliner les demandes en erreur des souscriptions
-LOCKED, et celles des souscriptions dont TOUTES les demandes sont en ON_ERROR.
+Mode "on-error" (--on-error) : décliner les demandes des souscriptions dont
+TOUTES les demandes sont en ON_ERROR.
 1. même listing paginé que le mode delete, filtré côté script sur
-   geninfo.product == <product> et context.user == <user> ; est candidate une
-   souscription dont geninfo.status == LOCKED, ou dont geninfo.demands est non
-   vide sans aucune demande en SUCCESS (pré-filtre, confirmé à l'étape 2)
-2. Pour chaque candidate : GET {base}/state_manager/api/v1/subscriptions/<uuid>/demands
-   -> LOCKED : on garde les demandes dont status == ON_ERROR (raison LOCKED)
-   -> sinon : on ne garde la souscription que si TOUTES ses demandes sont en
-      ON_ERROR (raison ALL_ON_ERROR) ; --only-locked désactive ce second cas
+   geninfo.product == <product> et context.user == <user>
+2. est éligible une souscription dont geninfo.demands est non vide et dont
+   chaque demande a status == ON_ERROR ; les demandes à décliner sont celles-là
+   (leur uuid est celui de la demande)
 3. Avec --decline, pour chaque demande retenue :
-   POST {base}/state_manager/api/v1/demands/<demand_id>/status
+   POST {base}/state_manager/api/v1/demands/<uuid>/status
         {"status": "DECLINED", "reason": "to remove"}
 
 Usage:
@@ -47,10 +44,10 @@ Usage:
     python subscriptions_cleanup.py --product cos.bucket --base-url https://...
     python subscriptions_cleanup.py --page-size 50 --first-page 0   # pagination
     python subscriptions_cleanup.py --input scratch.json  # lit un JSON local au lieu du GET
-    python subscriptions_cleanup.py --locked                    # liste les demandes ON_ERROR (dry-run)
-    python subscriptions_cleanup.py --locked --decline          # POST DECLINED sur chacune
-    python subscriptions_cleanup.py --locked --decline --yes --reason "cleanup sprint 12"
-    python subscriptions_cleanup.py --locked --only-locked          # ignore les "toutes ON_ERROR"
+    python subscriptions_cleanup.py --on-error                  # liste les demandes à décliner (dry-run)
+    python subscriptions_cleanup.py --on-error --decline        # POST DECLINED sur chacune
+    python subscriptions_cleanup.py --on-error --decline --yes --reason "cleanup sprint 12"
+    python subscriptions_cleanup.py --on-error --subscription-status LOCKED   # restreint aux LOCKED
 
 TLS (certificat interne BNPP, sinon "CERTIFICATE_VERIFY_FAILED: self-signed
 certificate in certificate chain") :
@@ -86,11 +83,8 @@ MAX_PAGES = 10_000
 CA_CERTS_ENV = "ORCHESTRATOR_CA_CERTS"  # chemins séparés par os.pathsep (":" sur macOS/Linux)
 
 STATE_MANAGER_PREFIX = "/state_manager/api/v1"
-LOCKED_STATUS = "LOCKED"
 DEMAND_ON_ERROR_STATUS = "ON_ERROR"
 DECLINED_STATUS = "DECLINED"
-REASON_LOCKED = "LOCKED"
-REASON_ALL_ON_ERROR = "ALL_ON_ERROR"
 DEFAULT_DECLINE_REASON = "to remove"
 
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
@@ -124,7 +118,7 @@ class Subscription:
 
 @dataclass
 class ErrorDemand:
-    """Demande en erreur d'une souscription LOCKED (mode --locked)."""
+    """Demande d'une souscription dont toutes les demandes sont en erreur (mode --on-error)."""
     subscription_id: str
     demand_id: str
     subscription_name: str = ""
@@ -132,7 +126,6 @@ class ErrorDemand:
     action: str = ""
     status: str = ""
     create_date: str = ""
-    reason: str = REASON_LOCKED  # LOCKED ou ALL_ON_ERROR
 
 
 # --------------------------------------------------------------------------- #
@@ -245,28 +238,22 @@ def demand_uuid(demand: dict[str, Any]) -> str:
     return _first(demand, "uuid", "demand_id", "id")
 
 
-def listing_has_no_success(row: dict[str, Any]) -> bool:
-    """True si geninfo.demands est non vide et qu'aucune demande n'est en SUCCESS."""
+def all_demands_in_status(row: dict[str, Any], status: str = DEMAND_ON_ERROR_STATUS) -> bool:
+    """True si geninfo.demands est non vide et que chaque demande a ce status."""
     demands = (row.get("geninfo") or {}).get("demands") or []
-    return bool(demands) and all(d.get("status") != SUCCESS_STATUS for d in demands)
+    return bool(demands) and all(d.get("status") == status for d in demands)
 
 
 def find_error_demands(
     subscriptions: Iterable[dict[str, Any]],
-    fetch_demands: Callable[[str], Any],
     user: str | None = DEFAULT_USER,
-    subscription_status_filter: str | None = LOCKED_STATUS,
     demand_status: str = DEMAND_ON_ERROR_STATUS,
-    include_all_error: bool = True,
+    subscription_status_filter: str | None = None,
 ) -> list[ErrorDemand]:
-    """Filtre les rows du listing sur context.user == user (si user n'est pas None),
-    puis retient :
-      - les souscriptions LOCKED (geninfo.status == subscription_status_filter) :
-        leurs demandes state_manager en demand_status, raison LOCKED ;
-      - si include_all_error, les souscriptions dont geninfo.demands n'a aucun
-        SUCCESS et dont TOUTES les demandes state_manager sont en demand_status,
-        raison ALL_ON_ERROR.
-    fetch_demands(uuid) n'est appelé que pour les candidates."""
+    """Souscriptions du listing dont TOUTES les demandes (geninfo.demands) sont en
+    demand_status, filtrées sur context.user == user (si user n'est pas None) et
+    sur geninfo.status == subscription_status_filter (si fourni). Retourne leurs
+    demandes, triées par souscription puis create_date."""
     found: list[ErrorDemand] = []
     for row in subscriptions:
         sub_id = subscription_uuid(row)
@@ -275,28 +262,22 @@ def find_error_demands(
         row_user = subscription_user(row)
         if user is not None and row_user != user:
             continue
-        is_locked = not subscription_status_filter or subscription_status(row) == subscription_status_filter
-        maybe_all_error = include_all_error and not is_locked and listing_has_no_success(row)
-        if not (is_locked or maybe_all_error):
+        if subscription_status_filter and subscription_status(row) != subscription_status_filter:
             continue
-        sm_demands = extract_items(fetch_demands(sub_id))
-        errors = [d for d in sm_demands if d.get("status") == demand_status and demand_uuid(d)]
-        if is_locked:
-            reason = REASON_LOCKED
-        elif errors and len(errors) == len(sm_demands):
-            reason = REASON_ALL_ON_ERROR
-        else:
+        if not all_demands_in_status(row, demand_status):
             continue
-        for demand in errors:
+        for demand in (row.get("geninfo") or {}).get("demands") or []:
+            demand_id = demand_uuid(demand)
+            if not demand_id:
+                continue
             found.append(ErrorDemand(
                 subscription_id=sub_id,
-                demand_id=demand_uuid(demand),
+                demand_id=demand_id,
                 subscription_name=subscription_name(row),
                 user=row_user,
                 action=_first(demand, "action"),
                 status=str(demand.get("status", "")),
                 create_date=_first(demand, "create_date", "created_at"),
-                reason=reason,
             ))
     found.sort(key=lambda d: (d.subscription_id, d.create_date, d.demand_id))
     return found
@@ -547,12 +528,7 @@ class OrchestratorClient:
         path = f"/api/v1/demands/{urllib.parse.quote(demand_id, safe='')}/retry"
         return self._request("POST", path, {"tasks": tasks, "retry_non_failed_tasks": retry_non_failed_tasks})
 
-    # --- state_manager (mode --locked) ---
-
-    def get_subscription_demands(self, subscription_id: str) -> Any:
-        """GET /state_manager/api/v1/subscriptions/<uuid>/demands."""
-        path = f"{STATE_MANAGER_PREFIX}/subscriptions/{urllib.parse.quote(subscription_id, safe='')}/demands"
-        return self._request("GET", path)
+    # --- state_manager (mode --on-error) ---
 
     def set_demand_status(self, demand_id: str, status: str = DECLINED_STATUS,
                           reason: str = DEFAULT_DECLINE_REASON) -> Any:
@@ -609,19 +585,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--delete", action="store_true",
                         help="exécuter réellement les DELETE (sinon: liste seulement)")
     parser.add_argument("--yes", action="store_true", help="ne pas demander de confirmation")
-    locked = parser.add_argument_group("mode locked (state_manager)")
-    locked.add_argument("--locked", action="store_true",
-                        help="lister les demandes en erreur des souscriptions LOCKED (state_manager)")
-    locked.add_argument("--decline", action="store_true",
-                        help=f"avec --locked : POST status={DECLINED_STATUS} sur chaque demande listée")
-    locked.add_argument("--only-locked", action="store_true",
-                        help="ne pas remonter les souscriptions dont toutes les demandes sont en erreur")
-    locked.add_argument("--reason", default=DEFAULT_DECLINE_REASON,
-                        help=f"reason envoyée avec le POST status (défaut: {DEFAULT_DECLINE_REASON!r})")
-    locked.add_argument("--subscription-status", default=LOCKED_STATUS,
-                        help=f"geninfo.status des souscriptions à traiter (défaut: {LOCKED_STATUS})")
-    locked.add_argument("--demand-status", default=DEMAND_ON_ERROR_STATUS,
-                        help=f"status des demandes à décliner (défaut: {DEMAND_ON_ERROR_STATUS})")
+    on_error = parser.add_argument_group("mode on-error (demandes à décliner)")
+    on_error.add_argument("--on-error", "--locked", action="store_true", dest="on_error",
+                          help="lister les demandes des souscriptions dont toutes les demandes sont en ON_ERROR")
+    on_error.add_argument("--decline", action="store_true",
+                          help=f"avec --on-error : POST status={DECLINED_STATUS} sur chaque demande listée")
+    on_error.add_argument("--reason", default=DEFAULT_DECLINE_REASON,
+                          help=f"reason envoyée avec le POST status (défaut: {DEFAULT_DECLINE_REASON!r})")
+    on_error.add_argument("--subscription-status", default=None,
+                          help="ne garder que les souscriptions ayant ce geninfo.status (ex: LOCKED ; défaut: tous)")
+    on_error.add_argument("--demand-status", default=DEMAND_ON_ERROR_STATUS,
+                          help=f"status que doivent avoir toutes les demandes (défaut: {DEMAND_ON_ERROR_STATUS})")
     tls = parser.add_mutually_exclusive_group()
     tls.add_argument("--ca-cert", nargs="+", metavar="FILE", dest="ca_certs",
                      default=ca_certs_from_env(os.environ.get(CA_CERTS_ENV)),
@@ -635,17 +609,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.page_size < 1:
         parser.error("--page-size doit être >= 1")
-    if args.decline and not args.locked:
-        parser.error("--decline nécessite --locked")
-    if args.locked and (args.input or args.delete):
-        parser.error("--locked est incompatible avec --input et --delete")
+    if args.decline and not args.on_error:
+        parser.error("--decline nécessite --on-error")
+    if args.on_error and args.delete:
+        parser.error("--on-error est incompatible avec --delete")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.locked:
-        return main_locked(args)
+    if args.on_error:
+        return main_on_error(args)
 
     if args.input:
         with open(args.input, encoding="utf-8") as fh:
@@ -734,67 +708,65 @@ def main(argv: list[str] | None = None) -> int:
     return 3 if failures else 0
 
 
-def main_locked(args: argparse.Namespace) -> int:
-    """Mode --locked : liste (et avec --decline, décline) les demandes en erreur
-    des souscriptions LOCKED via state_manager."""
-    if not args.token:
-        print("Token manquant: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
-        return 1
-    try:
-        client = _make_client(args)
-    except (OSError, ValueError) as exc:
-        print(f"Certificat CA invalide: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        subscriptions = extract_rows(_fetch_all_subscriptions(client, args))
-    except OrchestratorApiError as exc:
-        print(f"GET échoué: {exc}", file=sys.stderr)
-        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
-            print(f"Astuce: passer le CA interne avec --ca-cert <fichier.cer> (ou ${CA_CERTS_ENV}).",
-                  file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        print(f"Réponse inattendue: {exc}", file=sys.stderr)
-        return 2
+def main_on_error(args: argparse.Namespace) -> int:
+    """Mode --on-error : liste (et avec --decline, décline) les demandes des
+    souscriptions dont toutes les demandes sont en ON_ERROR."""
+    client: OrchestratorClient | None = None
+    if args.input:
+        with open(args.input, encoding="utf-8") as fh:
+            body = json.load(fh)
+    else:
+        if not args.token:
+            print("Token manquant: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
+            return 1
+        try:
+            client = _make_client(args)
+        except (OSError, ValueError) as exc:
+            print(f"Certificat CA invalide: {exc}", file=sys.stderr)
+            return 1
+        try:
+            body = _fetch_all_subscriptions(client, args)
+        except OrchestratorApiError as exc:
+            print(f"GET échoué: {exc}", file=sys.stderr)
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                print(f"Astuce: passer le CA interne avec --ca-cert <fichier.cer> (ou ${CA_CERTS_ENV}).",
+                      file=sys.stderr)
+            return 2
 
     user_filter = None if args.all_users else args.user
-    fetch_errors: list[str] = []
-
-    def fetch_demands(subscription_id: str) -> Any:
-        try:
-            return client.get_subscription_demands(subscription_id)
-        except OrchestratorApiError as exc:
-            fetch_errors.append(f"{subscription_id}: {exc}")
-            return []
-
-    demands = find_error_demands(subscriptions, fetch_demands, user_filter,
-                                 args.subscription_status, args.demand_status,
-                                 include_all_error=not args.only_locked)
-    for line in fetch_errors:
-        print(f"GET demands échoué: {line}", file=sys.stderr)
+    subscriptions = extract_rows(body)
+    demands = find_error_demands(subscriptions, user_filter, args.demand_status, args.subscription_status)
+    eligible_subs = {d.subscription_id for d in demands}
 
     if args.as_json and not args.decline:
         print(json.dumps([{"subscription_id": d.subscription_id, "demand_id": d.demand_id,
-                           "action": d.action, "status": d.status, "reason": d.reason}
-                          for d in demands], indent=2))
-        return 2 if fetch_errors else 0
+                           "action": d.action, "status": d.status} for d in demands], indent=2))
+        return 0
 
     scope = "tous users" if user_filter is None else f"user={user_filter}"
-    n_locked = len({d.subscription_id for d in demands if d.reason == REASON_LOCKED})
-    n_all_error = len({d.subscription_id for d in demands if d.reason == REASON_ALL_ON_ERROR})
-    print(f"{len(subscriptions)} souscription(s) lue(s) ({scope}) : "
-          f"{n_locked} {args.subscription_status}, {n_all_error} toutes demandes {args.demand_status}, "
-          f"{len(demands)} demande(s) à passer en {DECLINED_STATUS}")
+    if args.subscription_status:
+        scope += f", status={args.subscription_status}"
+    print(f"{len(subscriptions)} souscription(s) lue(s) ({scope}) : {len(eligible_subs)} avec toutes leurs "
+          f"demandes en {args.demand_status}, {len(demands)} demande(s) à passer en {DECLINED_STATUS}")
     for d in demands:
-        print(f"  {d.subscription_id}  {d.subscription_name:<16} {d.user:<12} {d.reason:<12} "
+        print(f"  {d.subscription_id}  {d.subscription_name:<16} {d.user:<12} "
               f"demand={d.demand_id} {d.action:<12} {d.status:<10} {d.create_date}"
               f"  -> {DECLINED_STATUS} ({args.reason})")
 
     if not args.decline or not demands:
         if demands and not args.decline:
-            print("\nDry-run: relancer avec --locked --decline pour exécuter.")
-        return 2 if fetch_errors else 0
+            print("\nDry-run: relancer avec --on-error --decline pour exécuter.")
+        return 0
+
+    if client is None:
+        if not args.token:
+            print("Token manquant pour les POST status: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
+            return 1
+        try:
+            client = _make_client(args)
+        except (OSError, ValueError) as exc:
+            print(f"Certificat CA invalide: {exc}", file=sys.stderr)
+            return 1
 
     if not args.yes:
         answer = input(f"\nPasser {len(demands)} demande(s) en {DECLINED_STATUS} ? [y/N] ").strip().lower()
@@ -804,16 +776,16 @@ def main_locked(args: argparse.Namespace) -> int:
 
     failures = 0
     for d in demands:
+        label = d.subscription_name or d.subscription_id
         try:
             response = client.set_demand_status(d.demand_id, DECLINED_STATUS, args.reason)
-            print(f"DECLINE {d.demand_id} ({d.subscription_name or d.subscription_id}) -> OK {_summ(response)}")
+            print(f"DECLINE {d.demand_id} ({label}) -> OK {_summ(response)}")
         except OrchestratorApiError as exc:
             failures += 1
-            print(f"DECLINE {d.demand_id} ({d.subscription_name or d.subscription_id}) -> ERREUR {exc}",
-                  file=sys.stderr)
+            print(f"DECLINE {d.demand_id} ({label}) -> ERREUR {exc}", file=sys.stderr)
 
     print(f"\n{len(demands) - failures} déclinée(s), {failures} en échec.")
-    return 3 if failures or fetch_errors else 0
+    return 3 if failures else 0
 
 
 def _fetch_all_subscriptions(client: OrchestratorClient, args: argparse.Namespace) -> dict[str, Any]:
