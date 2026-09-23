@@ -22,7 +22,9 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
             {"tasks": [<names>], "retry_non_failed_tasks": false}
 
 Mode "locked" (--locked) : décliner les demandes en erreur des souscriptions LOCKED.
-1. GET  {base}/state_manager/api/v1/subscription?status=LOCKED
+1. GET  {base}/multireader/api/v1/subscriptions?product=<product>  (même listing
+   que le mode delete), filtré côté script sur context.user == <user> et
+   geninfo.status == LOCKED
 2. Pour chaque souscription : GET {base}/state_manager/api/v1/subscriptions/<uuid>/demands
    -> on garde les demandes dont status == ON_ERROR
 3. Avec --decline, pour chaque demande retenue :
@@ -204,8 +206,10 @@ def _first(mapping: dict[str, Any], *keys: str) -> str:
 
 
 def subscription_uuid(row: dict[str, Any]) -> str:
+    """uuid de la souscription : geninfo.subscription_id (rows multireader),
+    sinon uuid / subscription_id / id au premier niveau."""
     geninfo = row.get("geninfo") or {}
-    return _first(row, "uuid", "subscription_id", "id") or _first(geninfo, "subscription_id", "uuid", "id")
+    return _first(geninfo, "subscription_id", "uuid") or _first(row, "uuid", "subscription_id", "id")
 
 
 def subscription_user(row: dict[str, Any]) -> str:
@@ -234,22 +238,18 @@ def find_error_demands(
     subscription_status_filter: str | None = LOCKED_STATUS,
     demand_status: str = DEMAND_ON_ERROR_STATUS,
 ) -> list[ErrorDemand]:
-    """Pour chaque souscription (déjà filtrée côté API sur status=LOCKED, re-vérifié
-    ici quand le champ est présent), récupère ses demandes via fetch_demands(uuid)
-    et retourne celles dont status == demand_status.
-
-    Le filtre user ne s'applique qu'aux rows qui exposent un user (context.user,
-    user, owner, requester) ; une row sans user est conservée."""
+    """Filtre les rows du listing (context.user == user si user n'est pas None,
+    geninfo.status == subscription_status_filter), récupère leurs demandes via
+    fetch_demands(uuid) et retourne celles dont status == demand_status."""
     found: list[ErrorDemand] = []
     for row in subscriptions:
         sub_id = subscription_uuid(row)
         if not sub_id:
             continue
-        row_status = subscription_status(row)
-        if subscription_status_filter and row_status and row_status != subscription_status_filter:
+        if subscription_status_filter and subscription_status(row) != subscription_status_filter:
             continue
         row_user = subscription_user(row)
-        if user is not None and row_user and row_user != user:
+        if user is not None and row_user != user:
             continue
         for demand in extract_items(fetch_demands(sub_id)):
             if demand.get("status") != demand_status:
@@ -415,11 +415,6 @@ class OrchestratorClient:
 
     # --- state_manager (mode --locked) ---
 
-    def list_subscriptions_by_status(self, status: str = LOCKED_STATUS) -> Any:
-        """GET /state_manager/api/v1/subscription?status=<status>."""
-        query = urllib.parse.urlencode({"status": status})
-        return self._request("GET", f"{STATE_MANAGER_PREFIX}/subscription?{query}")
-
     def get_subscription_demands(self, subscription_id: str) -> Any:
         """GET /state_manager/api/v1/subscriptions/<uuid>/demands."""
         path = f"{STATE_MANAGER_PREFIX}/subscriptions/{urllib.parse.quote(subscription_id, safe='')}/demands"
@@ -483,7 +478,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     locked.add_argument("--reason", default=DEFAULT_DECLINE_REASON,
                         help=f"reason envoyée avec le POST status (défaut: {DEFAULT_DECLINE_REASON!r})")
     locked.add_argument("--subscription-status", default=LOCKED_STATUS,
-                        help=f"status des souscriptions à traiter (défaut: {LOCKED_STATUS})")
+                        help=f"geninfo.status des souscriptions à traiter (défaut: {LOCKED_STATUS})")
     locked.add_argument("--demand-status", default=DEMAND_ON_ERROR_STATUS,
                         help=f"status des demandes à décliner (défaut: {DEMAND_ON_ERROR_STATUS})")
     tls = parser.add_mutually_exclusive_group()
@@ -609,7 +604,7 @@ def main_locked(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        subscriptions = extract_items(client.list_subscriptions_by_status(args.subscription_status))
+        subscriptions = extract_rows(client.get_subscriptions(args.product))
     except OrchestratorApiError as exc:
         print(f"GET échoué: {exc}", file=sys.stderr)
         if "CERTIFICATE_VERIFY_FAILED" in str(exc):
@@ -641,8 +636,11 @@ def main_locked(args: argparse.Namespace) -> int:
         return 2 if fetch_errors else 0
 
     scope = "tous users" if user_filter is None else f"user={user_filter}"
-    print(f"{len(subscriptions)} souscription(s) {args.subscription_status}, "
-          f"{len(demands)} demande(s) {args.demand_status} ({scope})")
+    locked = [r for r in subscriptions
+              if subscription_status(r) == args.subscription_status
+              and (user_filter is None or subscription_user(r) == user_filter)]
+    print(f"{len(subscriptions)} souscription(s) lue(s), {len(locked)} {args.subscription_status} ({scope}), "
+          f"{len(demands)} demande(s) {args.demand_status}")
     for d in demands:
         print(f"  {d.subscription_id}  {d.subscription_name:<16} {d.user:<12} "
               f"demand={d.demand_id} {d.action:<12} {d.status:<10} {d.create_date}"
