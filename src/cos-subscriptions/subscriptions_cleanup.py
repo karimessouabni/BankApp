@@ -23,11 +23,16 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
        POST {base}/api/v1/demands/<demand_uuid>/retry
             {"tasks": [<names>], "retry_non_failed_tasks": false}
 
-Mode "locked" (--locked) : décliner les demandes en erreur des souscriptions LOCKED.
+Mode "locked" (--locked) : décliner les demandes en erreur des souscriptions
+LOCKED, et celles des souscriptions dont TOUTES les demandes sont en ON_ERROR.
 1. même listing paginé que le mode delete, filtré côté script sur
-   geninfo.product == <product>, context.user == <user> et geninfo.status == LOCKED
-2. Pour chaque souscription : GET {base}/state_manager/api/v1/subscriptions/<uuid>/demands
-   -> on garde les demandes dont status == ON_ERROR
+   geninfo.product == <product> et context.user == <user> ; est candidate une
+   souscription dont geninfo.status == LOCKED, ou dont geninfo.demands est non
+   vide sans aucune demande en SUCCESS (pré-filtre, confirmé à l'étape 2)
+2. Pour chaque candidate : GET {base}/state_manager/api/v1/subscriptions/<uuid>/demands
+   -> LOCKED : on garde les demandes dont status == ON_ERROR (raison LOCKED)
+   -> sinon : on ne garde la souscription que si TOUTES ses demandes sont en
+      ON_ERROR (raison ALL_ON_ERROR) ; --only-locked désactive ce second cas
 3. Avec --decline, pour chaque demande retenue :
    POST {base}/state_manager/api/v1/demands/<demand_id>/status
         {"status": "DECLINED", "reason": "to remove"}
@@ -45,6 +50,7 @@ Usage:
     python subscriptions_cleanup.py --locked                    # liste les demandes ON_ERROR (dry-run)
     python subscriptions_cleanup.py --locked --decline          # POST DECLINED sur chacune
     python subscriptions_cleanup.py --locked --decline --yes --reason "cleanup sprint 12"
+    python subscriptions_cleanup.py --locked --only-locked          # ignore les "toutes ON_ERROR"
 
 TLS (certificat interne BNPP, sinon "CERTIFICATE_VERIFY_FAILED: self-signed
 certificate in certificate chain") :
@@ -83,6 +89,8 @@ STATE_MANAGER_PREFIX = "/state_manager/api/v1"
 LOCKED_STATUS = "LOCKED"
 DEMAND_ON_ERROR_STATUS = "ON_ERROR"
 DECLINED_STATUS = "DECLINED"
+REASON_LOCKED = "LOCKED"
+REASON_ALL_ON_ERROR = "ALL_ON_ERROR"
 DEFAULT_DECLINE_REASON = "to remove"
 
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
@@ -124,6 +132,7 @@ class ErrorDemand:
     action: str = ""
     status: str = ""
     create_date: str = ""
+    reason: str = REASON_LOCKED  # LOCKED ou ALL_ON_ERROR
 
 
 # --------------------------------------------------------------------------- #
@@ -236,40 +245,58 @@ def demand_uuid(demand: dict[str, Any]) -> str:
     return _first(demand, "uuid", "demand_id", "id")
 
 
+def listing_has_no_success(row: dict[str, Any]) -> bool:
+    """True si geninfo.demands est non vide et qu'aucune demande n'est en SUCCESS."""
+    demands = (row.get("geninfo") or {}).get("demands") or []
+    return bool(demands) and all(d.get("status") != SUCCESS_STATUS for d in demands)
+
+
 def find_error_demands(
     subscriptions: Iterable[dict[str, Any]],
     fetch_demands: Callable[[str], Any],
     user: str | None = DEFAULT_USER,
     subscription_status_filter: str | None = LOCKED_STATUS,
     demand_status: str = DEMAND_ON_ERROR_STATUS,
+    include_all_error: bool = True,
 ) -> list[ErrorDemand]:
-    """Filtre les rows du listing (context.user == user si user n'est pas None,
-    geninfo.status == subscription_status_filter), récupère leurs demandes via
-    fetch_demands(uuid) et retourne celles dont status == demand_status."""
+    """Filtre les rows du listing sur context.user == user (si user n'est pas None),
+    puis retient :
+      - les souscriptions LOCKED (geninfo.status == subscription_status_filter) :
+        leurs demandes state_manager en demand_status, raison LOCKED ;
+      - si include_all_error, les souscriptions dont geninfo.demands n'a aucun
+        SUCCESS et dont TOUTES les demandes state_manager sont en demand_status,
+        raison ALL_ON_ERROR.
+    fetch_demands(uuid) n'est appelé que pour les candidates."""
     found: list[ErrorDemand] = []
     for row in subscriptions:
         sub_id = subscription_uuid(row)
         if not sub_id:
             continue
-        if subscription_status_filter and subscription_status(row) != subscription_status_filter:
-            continue
         row_user = subscription_user(row)
         if user is not None and row_user != user:
             continue
-        for demand in extract_items(fetch_demands(sub_id)):
-            if demand.get("status") != demand_status:
-                continue
-            demand_id = demand_uuid(demand)
-            if not demand_id:
-                continue
+        is_locked = not subscription_status_filter or subscription_status(row) == subscription_status_filter
+        maybe_all_error = include_all_error and not is_locked and listing_has_no_success(row)
+        if not (is_locked or maybe_all_error):
+            continue
+        sm_demands = extract_items(fetch_demands(sub_id))
+        errors = [d for d in sm_demands if d.get("status") == demand_status and demand_uuid(d)]
+        if is_locked:
+            reason = REASON_LOCKED
+        elif errors and len(errors) == len(sm_demands):
+            reason = REASON_ALL_ON_ERROR
+        else:
+            continue
+        for demand in errors:
             found.append(ErrorDemand(
                 subscription_id=sub_id,
-                demand_id=demand_id,
+                demand_id=demand_uuid(demand),
                 subscription_name=subscription_name(row),
                 user=row_user,
                 action=_first(demand, "action"),
                 status=str(demand.get("status", "")),
                 create_date=_first(demand, "create_date", "created_at"),
+                reason=reason,
             ))
     found.sort(key=lambda d: (d.subscription_id, d.create_date, d.demand_id))
     return found
@@ -587,6 +614,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="lister les demandes en erreur des souscriptions LOCKED (state_manager)")
     locked.add_argument("--decline", action="store_true",
                         help=f"avec --locked : POST status={DECLINED_STATUS} sur chaque demande listée")
+    locked.add_argument("--only-locked", action="store_true",
+                        help="ne pas remonter les souscriptions dont toutes les demandes sont en erreur")
     locked.add_argument("--reason", default=DEFAULT_DECLINE_REASON,
                         help=f"reason envoyée avec le POST status (défaut: {DEFAULT_DECLINE_REASON!r})")
     locked.add_argument("--subscription-status", default=LOCKED_STATUS,
@@ -740,23 +769,25 @@ def main_locked(args: argparse.Namespace) -> int:
             return []
 
     demands = find_error_demands(subscriptions, fetch_demands, user_filter,
-                                 args.subscription_status, args.demand_status)
+                                 args.subscription_status, args.demand_status,
+                                 include_all_error=not args.only_locked)
     for line in fetch_errors:
         print(f"GET demands échoué: {line}", file=sys.stderr)
 
     if args.as_json and not args.decline:
         print(json.dumps([{"subscription_id": d.subscription_id, "demand_id": d.demand_id,
-                           "action": d.action, "status": d.status} for d in demands], indent=2))
+                           "action": d.action, "status": d.status, "reason": d.reason}
+                          for d in demands], indent=2))
         return 2 if fetch_errors else 0
 
     scope = "tous users" if user_filter is None else f"user={user_filter}"
-    locked = [r for r in subscriptions
-              if subscription_status(r) == args.subscription_status
-              and (user_filter is None or subscription_user(r) == user_filter)]
-    print(f"{len(subscriptions)} souscription(s) lue(s), {len(locked)} {args.subscription_status} ({scope}), "
-          f"{len(demands)} demande(s) {args.demand_status}")
+    n_locked = len({d.subscription_id for d in demands if d.reason == REASON_LOCKED})
+    n_all_error = len({d.subscription_id for d in demands if d.reason == REASON_ALL_ON_ERROR})
+    print(f"{len(subscriptions)} souscription(s) lue(s) ({scope}) : "
+          f"{n_locked} {args.subscription_status}, {n_all_error} toutes demandes {args.demand_status}, "
+          f"{len(demands)} demande(s) à passer en {DECLINED_STATUS}")
     for d in demands:
-        print(f"  {d.subscription_id}  {d.subscription_name:<16} {d.user:<12} "
+        print(f"  {d.subscription_id}  {d.subscription_name:<16} {d.user:<12} {d.reason:<12} "
               f"demand={d.demand_id} {d.action:<12} {d.status:<10} {d.create_date}"
               f"  -> {DECLINED_STATUS} ({args.reason})")
 

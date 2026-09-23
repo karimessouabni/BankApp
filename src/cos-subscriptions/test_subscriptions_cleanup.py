@@ -407,6 +407,53 @@ class LockedModeTests(unittest.TestCase):
         self.assertEqual(found[0].subscription_name, "bu003i023571")
         self.assertEqual(found[0].user, "h90871")
 
+    def test_all_on_error_subscriptions_are_declined_too(self):
+        # ACTIVE mais toutes les demandes du listing en erreur -> candidate
+        all_err = _row("s-allerr", [_demand("create", "ON_ERROR"), _demand("delete", "ERROR")], name="allerr")
+        all_err["geninfo"]["status"] = "ACTIVE"
+        # une demande SUCCESS dans le listing -> jamais candidate (pas de GET)
+        mixed_listing = _row("s-mixed", [_demand("create"), _demand("delete", "ON_ERROR")])
+        mixed_listing["geninfo"]["status"] = "ACTIVE"
+        # listing sans SUCCESS, mais state_manager remonte une demande hors ON_ERROR -> exclue
+        sm_mixed = _row("s-sm-mixed", [_demand("create", "ERROR")])
+        sm_mixed["geninfo"]["status"] = "ACTIVE"
+        # listing sans SUCCESS, state_manager vide -> exclue
+        sm_empty = _row("s-sm-empty", [_demand("create", "ERROR")])
+        sm_empty["geninfo"]["status"] = "ACTIVE"
+        # listing sans demandes -> pas candidate
+        no_demands = _row("s-nodemands", [])
+        no_demands["geninfo"]["status"] = "ACTIVE"
+        locked = _sm_sub("s-locked")
+        subs = [all_err, mixed_listing, sm_mixed, sm_empty, no_demands, locked]
+        sm = {
+            "s-allerr": [_sm_demand("d-e1"), _sm_demand("d-e2", action="create")],
+            "s-sm-mixed": [_sm_demand("d-m1"), _sm_demand("d-m2", status="SUCCESS")],
+            "s-sm-empty": [],
+            "s-locked": [_sm_demand("d-l1"), _sm_demand("d-l2", status="SUCCESS")],
+        }
+        calls = []
+
+        def fetch(sub_id):
+            calls.append(sub_id)
+            return sm[sub_id]
+
+        found = sc.find_error_demands(subs, fetch)
+        self.assertEqual(calls, ["s-allerr", "s-sm-mixed", "s-sm-empty", "s-locked"])
+        self.assertEqual([(d.subscription_id, d.demand_id, d.reason) for d in found], [
+            ("s-allerr", "d-e1", "ALL_ON_ERROR"), ("s-allerr", "d-e2", "ALL_ON_ERROR"),
+            ("s-locked", "d-l1", "LOCKED"),
+        ])
+        calls.clear()
+        found = sc.find_error_demands(subs, fetch, include_all_error=False)
+        self.assertEqual(calls, ["s-locked"])
+        self.assertEqual([d.demand_id for d in found], ["d-l1"])
+
+    def test_listing_has_no_success(self):
+        self.assertTrue(sc.listing_has_no_success(_row("s", [_demand("create", "ON_ERROR")])))
+        self.assertFalse(sc.listing_has_no_success(_row("s", [_demand("create"), _demand("delete", "ON_ERROR")])))
+        self.assertFalse(sc.listing_has_no_success(_row("s", [])))
+        self.assertFalse(sc.listing_has_no_success({}))
+
     def test_find_error_demands_all_users_and_custom_statuses(self):
         subs = [_sm_sub("s1", user="h00000", status="PENDING")]
         fetch = lambda _: [_sm_demand("d1", status="FAILED"), _sm_demand("d2", status="ON_ERROR")]
@@ -432,6 +479,8 @@ class LockedModeTests(unittest.TestCase):
     def test_cli_locked_flags(self):
         args = sc.parse_args(["--locked", "--decline", "--yes", "--reason", "r"])
         self.assertTrue(args.locked and args.decline and args.yes)
+        self.assertFalse(args.only_locked)
+        self.assertTrue(sc.parse_args(["--locked", "--only-locked"]).only_locked)
         self.assertEqual(args.reason, "r")
         self.assertEqual(args.subscription_status, "LOCKED")
         self.assertEqual(args.demand_status, "ON_ERROR")
@@ -455,7 +504,9 @@ class LockedModeTests(unittest.TestCase):
         self.assertEqual(client.get_subscriptions.call_args.args[:3], ("cos.bucket", 100, 1))
         client.get_subscription_demands.assert_called_once_with("s1")
         printed = "".join(c.args[0] for c in out.write.call_args_list)
-        self.assertIn("2 souscription(s) lue(s), 1 LOCKED (user=h90871), 1 demande(s) ON_ERROR", printed)
+        self.assertIn("2 souscription(s) lue(s) (user=h90871) : 1 LOCKED, 0 toutes demandes ON_ERROR, "
+                      "1 demande(s) à passer en DECLINED", printed)
+        self.assertIn("LOCKED", printed)
         self.assertIn("demand=d1", printed)
         self.assertIn("Dry-run", printed)
         client.set_demand_status.assert_not_called()
@@ -467,7 +518,8 @@ class LockedModeTests(unittest.TestCase):
             self.assertEqual(sc.main(["--locked", "--token", "t", "--json"]), 0)
         printed = "".join(c.args[0] for c in out.write.call_args_list)
         self.assertEqual(json.loads(printed),
-                         [{"subscription_id": "s1", "demand_id": "d1", "action": "delete", "status": "ON_ERROR"}])
+                         [{"subscription_id": "s1", "demand_id": "d1", "action": "delete", "status": "ON_ERROR",
+                           "reason": "LOCKED"}])
 
     def test_main_locked_decline_posts_each_demand(self):
         client = self._fake_client([_sm_sub("s1"), _sm_sub("s2")],
@@ -478,6 +530,23 @@ class LockedModeTests(unittest.TestCase):
             mock.call("d1", "DECLINED", "bye"), mock.call("d2", "DECLINED", "bye"), mock.call("d3", "DECLINED", "bye"),
         ])
         self.assertEqual(client.set_demand_status.call_count, 3)
+
+    def test_main_locked_declines_all_on_error_subscriptions(self):
+        all_err = _row("s-allerr", [_demand("delete", "ON_ERROR")])
+        all_err["geninfo"]["status"] = "ACTIVE"
+        client = self._fake_client([_sm_sub("s1"), all_err],
+                                   {"s1": [_sm_demand("d1")], "s-allerr": [_sm_demand("d-e1")]})
+        with mock.patch.object(sc, "_make_client", return_value=client), mock.patch("sys.stdout") as out:
+            self.assertEqual(sc.main(["--locked", "--decline", "--yes", "--token", "t"]), 0)
+        printed = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertIn("1 LOCKED, 1 toutes demandes ON_ERROR, 2 demande(s)", printed)
+        self.assertIn("ALL_ON_ERROR", printed)
+        self.assertEqual(client.set_demand_status.call_count, 2)
+        client = self._fake_client([_sm_sub("s1"), all_err],
+                                   {"s1": [_sm_demand("d1")], "s-allerr": [_sm_demand("d-e1")]})
+        with mock.patch.object(sc, "_make_client", return_value=client), mock.patch("sys.stdout"):
+            self.assertEqual(sc.main(["--locked", "--decline", "--yes", "--only-locked", "--token", "t"]), 0)
+        client.set_demand_status.assert_called_once_with("d1", "DECLINED", "to remove")
 
     def test_main_locked_decline_asks_confirmation(self):
         client = self._fake_client([_sm_sub("s1")], {"s1": [_sm_demand("d1")]})
