@@ -2,8 +2,10 @@
 """
 Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
 
-1. GET  {base}/multireader/api/v1/subscriptions?product=<product>
-   -> on ne garde que les rows dont context.user == <user> (défaut: h90871),
+1. GET  {base}/multireader/api/v1/subscriptions?page=<n>&size=100, page par page
+   jusqu'à la dernière (page incomplète, vide, ou total_pages/total atteint)
+   -> on ne garde que les rows dont geninfo.product == <product> et
+      context.user == <user> (défaut: h90871),
       puis pour chacune on regarde geninfo.demands :
       la souscription est "éligible" si :
         - toutes les demandes force_clean / create / update sont en SUCCESS,
@@ -22,9 +24,8 @@ Nettoyage des souscriptions orchestrator (produit cos.bucket par défaut).
             {"tasks": [<names>], "retry_non_failed_tasks": false}
 
 Mode "locked" (--locked) : décliner les demandes en erreur des souscriptions LOCKED.
-1. GET  {base}/multireader/api/v1/subscriptions?product=<product>  (même listing
-   que le mode delete), filtré côté script sur context.user == <user> et
-   geninfo.status == LOCKED
+1. même listing paginé que le mode delete, filtré côté script sur
+   geninfo.product == <product>, context.user == <user> et geninfo.status == LOCKED
 2. Pour chaque souscription : GET {base}/state_manager/api/v1/subscriptions/<uuid>/demands
    -> on garde les demandes dont status == ON_ERROR
 3. Avec --decline, pour chaque demande retenue :
@@ -39,6 +40,7 @@ Usage:
     python subscriptions_cleanup.py --user h12345               # autre user
     python subscriptions_cleanup.py --all-users                 # sans filtre user
     python subscriptions_cleanup.py --product cos.bucket --base-url https://...
+    python subscriptions_cleanup.py --page-size 50 --first-page 0   # pagination
     python subscriptions_cleanup.py --input scratch.json  # lit un JSON local au lieu du GET
     python subscriptions_cleanup.py --locked                    # liste les demandes ON_ERROR (dry-run)
     python subscriptions_cleanup.py --locked --decline          # POST DECLINED sur chacune
@@ -72,6 +74,9 @@ DEFAULT_PRODUCT = "cos.bucket"
 DEFAULT_PRODUCT_BRANCH = "main"
 DEFAULT_USER = "h90871"
 DEFAULT_TIMEOUT = 60
+DEFAULT_PAGE_SIZE = 100
+DEFAULT_FIRST_PAGE = 1
+MAX_PAGES = 10_000
 CA_CERTS_ENV = "ORCHESTRATOR_CA_CERTS"  # chemins séparés par os.pathsep (":" sur macOS/Linux)
 
 STATE_MANAGER_PREFIX = "/state_manager/api/v1"
@@ -270,6 +275,95 @@ def find_error_demands(
     return found
 
 
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def total_pages_hint(body: Any, size: int) -> int | None:
+    """Nombre total de pages annoncé par la réponse (total_pages / totalPages,
+    ou total / total_count / totalElements / count divisé par size), sinon None."""
+    if not isinstance(body, dict):
+        return None
+    candidates = [body]
+    result = body.get("result")
+    if isinstance(result, dict):
+        candidates.append(result)
+    for key in ("page", "pagination", "meta"):
+        for c in list(candidates):
+            nested = c.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    for c in candidates:
+        for key in ("total_pages", "totalPages", "pages", "page_count", "pageCount"):
+            n = _as_int(c.get(key))
+            if n is not None:
+                return max(n, 0)
+    for c in candidates:
+        for key in ("total", "total_count", "totalCount", "totalElements", "total_elements", "count"):
+            n = _as_int(c.get(key))
+            if n is not None:
+                return max(-(-n // size), 0) if size > 0 else None
+    return None
+
+
+def iterate_pages(
+    fetch_page: Callable[[int, int], Any],
+    size: int = DEFAULT_PAGE_SIZE,
+    first_page: int = DEFAULT_FIRST_PAGE,
+    max_pages: int = MAX_PAGES,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Appelle fetch_page(page, size) depuis first_page et concatène les rows.
+
+    Arrêt : page vide, page incomplète (< size), total_pages atteint, page
+    identique à la précédente (API qui ignore ?page=), ou max_pages."""
+    rows: list[dict[str, Any]] = []
+    previous_keys: list[str] | None = None
+    for index in range(max_pages):
+        page = first_page + index
+        body = fetch_page(page, size)
+        page_rows = extract_rows(body) if isinstance(body, dict) else extract_items(body)
+        if progress:
+            progress(page, len(page_rows))
+        if not page_rows:
+            break
+        keys = [subscription_uuid(r) for r in page_rows]
+        if keys == previous_keys:
+            break
+        rows.extend(page_rows)
+        hint = total_pages_hint(body, size)
+        if hint is not None and index + 1 >= hint:
+            break
+        if len(page_rows) < size:
+            break
+        previous_keys = keys
+    return rows
+
+
+def dedupe_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Supprime les doublons de subscription uuid (chevauchement de pages)."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        key = subscription_uuid(row)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(row)
+    return out
+
+
+def filter_product(rows: Iterable[dict[str, Any]], product: str | None) -> list[dict[str, Any]]:
+    """Garde les rows dont geninfo.product == product (rows sans product conservées)."""
+    if not product:
+        return list(rows)
+    return [r for r in rows if (r.get("geninfo") or {}).get("product", product) == product]
+
+
 def find_eligible_subscriptions(
     body: dict[str, Any], user: str | None = DEFAULT_USER
 ) -> list[Subscription]:
@@ -393,9 +487,22 @@ class OrchestratorClient:
             raise OrchestratorApiError(f"{method} {url} -> {exc.reason}") from exc
         return _try_json(raw)
 
-    def get_subscriptions(self, product: str = DEFAULT_PRODUCT) -> dict[str, Any]:
-        query = urllib.parse.urlencode({"product": product})
+    def get_subscriptions_page(self, page: int, size: int = DEFAULT_PAGE_SIZE) -> Any:
+        """GET /multireader/api/v1/subscriptions?page=<page>&size=<size>."""
+        query = urllib.parse.urlencode({"page": page, "size": size})
         return self._request("GET", f"/multireader/api/v1/subscriptions?{query}")
+
+    def get_subscriptions(
+        self,
+        product: str | None = DEFAULT_PRODUCT,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        first_page: int = DEFAULT_FIRST_PAGE,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Parcourt toutes les pages et retourne {"result": {"rows": [...]}} avec
+        toutes les souscriptions (dédoublonnées), filtrées sur geninfo.product."""
+        rows = iterate_pages(self.get_subscriptions_page, page_size, first_page, progress=progress)
+        return {"result": {"rows": filter_product(dedupe_rows(rows), product)}}
 
     def delete_subscription(
         self, subscription_id: str, product_branch: str = DEFAULT_PRODUCT_BRANCH
@@ -458,7 +565,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--token", default=os.environ.get("ORCHESTRATOR_TOKEN"),
                         help="bearer token (défaut: $ORCHESTRATOR_TOKEN)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--product", default=DEFAULT_PRODUCT)
+    parser.add_argument("--product", default=DEFAULT_PRODUCT,
+                        help=f"ne garder que les rows dont geninfo.product vaut cette valeur (défaut: {DEFAULT_PRODUCT})")
+    parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
+                        help=f"paramètre size de la pagination (défaut: {DEFAULT_PAGE_SIZE})")
+    parser.add_argument("--first-page", type=int, default=DEFAULT_FIRST_PAGE,
+                        help=f"numéro de la première page (défaut: {DEFAULT_FIRST_PAGE})")
     parser.add_argument("--product-branch", default=DEFAULT_PRODUCT_BRANCH,
                         help="valeur de product_branch dans le payload DELETE")
     parser.add_argument("--user", default=DEFAULT_USER,
@@ -492,6 +604,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="sortie JSON (liste des subscription_id éligibles)")
     args = parser.parse_args(argv)
+    if args.page_size < 1:
+        parser.error("--page-size doit être >= 1")
     if args.decline and not args.locked:
         parser.error("--decline nécessite --locked")
     if args.locked and (args.input or args.delete):
@@ -518,7 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Certificat CA invalide: {exc}", file=sys.stderr)
             return 1
         try:
-            body = client.get_subscriptions(args.product)
+            body = _fetch_all_subscriptions(client, args)
         except OrchestratorApiError as exc:
             print(f"GET échoué: {exc}", file=sys.stderr)
             if "CERTIFICATE_VERIFY_FAILED" in str(exc):
@@ -604,7 +718,7 @@ def main_locked(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        subscriptions = extract_rows(client.get_subscriptions(args.product))
+        subscriptions = extract_rows(_fetch_all_subscriptions(client, args))
     except OrchestratorApiError as exc:
         print(f"GET échoué: {exc}", file=sys.stderr)
         if "CERTIFICATE_VERIFY_FAILED" in str(exc):
@@ -669,6 +783,13 @@ def main_locked(args: argparse.Namespace) -> int:
 
     print(f"\n{len(demands) - failures} déclinée(s), {failures} en échec.")
     return 3 if failures or fetch_errors else 0
+
+
+def _fetch_all_subscriptions(client: OrchestratorClient, args: argparse.Namespace) -> dict[str, Any]:
+    def progress(page: int, count: int) -> None:
+        print(f"page {page}: {count} row(s)", file=sys.stderr)
+
+    return client.get_subscriptions(args.product, args.page_size, args.first_page, progress)
 
 
 def _make_client(args: argparse.Namespace) -> OrchestratorClient:

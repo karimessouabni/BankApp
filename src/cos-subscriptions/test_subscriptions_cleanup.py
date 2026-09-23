@@ -155,6 +155,76 @@ class RetryHelpersTests(unittest.TestCase):
         self.assertEqual(sc.failed_process_names({}), [])
 
 
+class PaginationTests(unittest.TestCase):
+    def _fetch(self, pages: dict, calls: list):
+        def fetch(page, size):
+            calls.append((page, size))
+            return pages.get(page, {"result": {"rows": []}})
+        return fetch
+
+    def test_stops_on_short_page(self):
+        calls = []
+        pages = {1: {"result": {"rows": [_row("a", []), _row("b", [])]}},
+                 2: {"result": {"rows": [_row("c", [])]}}}
+        rows = sc.iterate_pages(self._fetch(pages, calls), size=2)
+        self.assertEqual([sc.subscription_uuid(r) for r in rows], ["a", "b", "c"])
+        self.assertEqual(calls, [(1, 2), (2, 2)])
+
+    def test_stops_on_empty_page(self):
+        calls = []
+        pages = {1: {"result": {"rows": [_row("a", []), _row("b", [])]}}}
+        rows = sc.iterate_pages(self._fetch(pages, calls), size=2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(calls, [(1, 2), (2, 2)])
+
+    def test_stops_on_total_pages_hint(self):
+        calls = []
+        pages = {1: {"result": {"rows": [_row("a", []), _row("b", [])], "total_pages": 2}},
+                 2: {"result": {"rows": [_row("c", []), _row("d", [])], "total_pages": 2}},
+                 3: {"result": {"rows": [_row("zz", []), _row("zy", [])], "total_pages": 2}}}
+        rows = sc.iterate_pages(self._fetch(pages, calls), size=2)
+        self.assertEqual([sc.subscription_uuid(r) for r in rows], ["a", "b", "c", "d"])
+        self.assertEqual(calls, [(1, 2), (2, 2)])
+
+    def test_total_count_hint(self):
+        self.assertEqual(sc.total_pages_hint({"total": 250}, 100), 3)
+        self.assertEqual(sc.total_pages_hint({"result": {"totalElements": 200}}, 100), 2)
+        self.assertEqual(sc.total_pages_hint({"pagination": {"totalPages": 4}}, 100), 4)
+        self.assertEqual(sc.total_pages_hint({"total": 0}, 100), 0)
+        self.assertIsNone(sc.total_pages_hint({"result": {"rows": []}}, 100))
+        self.assertIsNone(sc.total_pages_hint([], 100))
+
+    def test_stops_when_api_ignores_page_param(self):
+        calls = []
+        same = {"result": {"rows": [_row("a", []), _row("b", [])]}}
+        rows = sc.iterate_pages(lambda p, s: (calls.append(p), same)[1], size=2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(calls, [1, 2])
+
+    def test_first_page_and_max_pages(self):
+        calls = []
+        full = lambda p, s: (calls.append(p), {"result": {"rows": [_row(f"a{p}", []), _row(f"b{p}", [])]}})[1]
+        rows = sc.iterate_pages(full, size=2, first_page=0, max_pages=3)
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(len(rows), 6)
+
+    def test_accepts_bare_list_pages(self):
+        pages = {1: [_row("a", [])]}
+        rows = sc.iterate_pages(lambda p, s: pages.get(p, []), size=2)
+        self.assertEqual(len(rows), 1)
+
+    def test_dedupe_rows(self):
+        rows = sc.dedupe_rows([_row("a", []), _row("b", []), _row("a", []), {"x": 1}, {"y": 2}])
+        self.assertEqual(len(rows), 4)
+
+    def test_cli_pagination_flags(self):
+        args = sc.parse_args(["--page-size", "50", "--first-page", "0"])
+        self.assertEqual((args.page_size, args.first_page), (50, 0))
+        self.assertEqual((sc.parse_args([]).page_size, sc.parse_args([]).first_page), (100, 1))
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            sc.parse_args(["--page-size", "0"])
+
+
 class ClientTests(unittest.TestCase):
     def test_get_demand_url(self):
         client = sc.OrchestratorClient("tok")
@@ -202,7 +272,38 @@ class ClientTests(unittest.TestCase):
         client = sc.OrchestratorClient("tok")
         with mock.patch.object(client, "_request", return_value={"result": {"rows": []}}) as req:
             client.get_subscriptions("cos.bucket")
-        req.assert_called_once_with("GET", "/multireader/api/v1/subscriptions?product=cos.bucket")
+        req.assert_called_once_with("GET", "/multireader/api/v1/subscriptions?page=1&size=100")
+        with mock.patch.object(client, "_request", return_value={"result": {"rows": []}}) as req:
+            client.get_subscriptions("cos.bucket", page_size=50, first_page=0)
+        req.assert_called_once_with("GET", "/multireader/api/v1/subscriptions?page=0&size=50")
+
+    def test_get_subscriptions_walks_all_pages(self):
+        client = sc.OrchestratorClient("tok")
+        pages = {
+            "/multireader/api/v1/subscriptions?page=1&size=2": {"result": {"rows": [_row("s1", []), _row("s2", [])]}},
+            "/multireader/api/v1/subscriptions?page=2&size=2": {"result": {"rows": [_row("s3", []), _row("s4", [])]}},
+            "/multireader/api/v1/subscriptions?page=3&size=2": {"result": {"rows": [_row("s5", [])]}},
+        }
+        seen = []
+        with mock.patch.object(client, "_request", side_effect=lambda m, path: pages[path]) as req:
+            body = client.get_subscriptions("cos.bucket", page_size=2, progress=lambda p, n: seen.append((p, n)))
+        self.assertEqual([r["geninfo"]["subscription_id"] for r in body["result"]["rows"]],
+                         ["s1", "s2", "s3", "s4", "s5"])
+        self.assertEqual(req.call_count, 3)
+        self.assertEqual(seen, [(1, 2), (2, 2), (3, 1)])
+
+    def test_get_subscriptions_filters_product(self):
+        client = sc.OrchestratorClient("tok")
+        other = _row("s2", [])
+        other["geninfo"]["product"] = "cos.instance"
+        no_product = _row("s3", [])
+        del no_product["geninfo"]["product"]
+        body = {"result": {"rows": [_row("s1", []), other, no_product]}}
+        with mock.patch.object(client, "_request", return_value=body):
+            rows = client.get_subscriptions("cos.bucket")["result"]["rows"]
+            self.assertEqual([r["geninfo"]["subscription_id"] for r in rows], ["s1", "s3"])
+            rows = client.get_subscriptions(None)["result"]["rows"]
+            self.assertEqual(len(rows), 3)
 
     def test_request_sets_bearer_header(self):
         client = sc.OrchestratorClient("tok")
@@ -351,7 +452,7 @@ class LockedModeTests(unittest.TestCase):
         with mock.patch.object(sc, "_make_client", return_value=client), \
              mock.patch("sys.stdout") as out:
             self.assertEqual(sc.main(["--locked", "--token", "t", "--product", "cos.bucket"]), 0)
-        client.get_subscriptions.assert_called_once_with("cos.bucket")
+        self.assertEqual(client.get_subscriptions.call_args.args[:3], ("cos.bucket", 100, 1))
         client.get_subscription_demands.assert_called_once_with("s1")
         printed = "".join(c.args[0] for c in out.write.call_args_list)
         self.assertIn("2 souscription(s) lue(s), 1 LOCKED (user=h90871), 1 demande(s) ON_ERROR", printed)
