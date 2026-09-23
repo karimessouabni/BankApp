@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
+import shutil
+import ssl
+import subprocess
 import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -227,6 +233,122 @@ class ClientTests(unittest.TestCase):
     def test_missing_token_rejected(self):
         with self.assertRaises(ValueError):
             sc.OrchestratorClient("")
+
+
+def _make_self_signed(tmpdir: str) -> tuple[str, str, str]:
+    """Génère (key.pem, cert.pem, cert.der) auto-signés pour localhost via openssl."""
+    key = os.path.join(tmpdir, "key.pem")
+    pem = os.path.join(tmpdir, "cert.pem")
+    der = os.path.join(tmpdir, "cert.der")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+         "-keyout", key, "-out", pem],
+        check=True, capture_output=True,
+    )
+    subprocess.run(["openssl", "x509", "-in", pem, "-outform", "DER", "-out", der],
+                   check=True, capture_output=True)
+    return key, pem, der
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl absent")
+class TlsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.key, cls.pem, cls.der = _make_self_signed(cls.tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_default_is_none(self):
+        self.assertIsNone(sc.build_ssl_context())
+        self.assertIsNone(sc.build_ssl_context([]))
+        self.assertIsNone(sc.build_ssl_context([""]))
+
+    def test_insecure_disables_verification(self):
+        ctx = sc.build_ssl_context(insecure=True)
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+
+    def test_insecure_wins_over_ca_certs(self):
+        ctx = sc.build_ssl_context(["/nonexistent.cer"], insecure=True)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+
+    def test_loads_pem_and_der(self):
+        for path in (self.pem, self.der):
+            ctx = sc.build_ssl_context([path])
+            self.assertTrue(ctx.check_hostname)
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+            subjects = [dict(x[0] for x in c["subject"]) for c in ctx.get_ca_certs()]
+            self.assertIn({"commonName": "localhost"}, subjects, path)
+
+    def test_expands_user_home(self):
+        home = os.path.dirname(self.der)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            ctx = sc.build_ssl_context(["~/cert.der"])
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_missing_or_invalid_file(self):
+        with self.assertRaises(OSError):
+            sc.build_ssl_context(["/nonexistent.cer"])
+        bad = os.path.join(self.tmpdir, "bad.cer")
+        with open(bad, "wb") as fh:
+            fh.write(b"not a certificate")
+        with self.assertRaises(ValueError):
+            sc.build_ssl_context([bad])
+        empty = os.path.join(self.tmpdir, "empty.cer")
+        open(empty, "wb").close()
+        with self.assertRaises(ValueError):
+            sc.build_ssl_context([empty])
+
+    def test_env_parsing(self):
+        self.assertEqual(sc.ca_certs_from_env(None), [])
+        self.assertEqual(sc.ca_certs_from_env(""), [])
+        self.assertEqual(sc.ca_certs_from_env(os.pathsep.join(["a.cer", " ", "b.cer"])), ["a.cer", "b.cer"])
+
+    def test_cli_flags(self):
+        self.assertEqual(sc.parse_args(["--ca-cert", "a.cer", "b.cer", "--delete"]).ca_certs, ["a.cer", "b.cer"])
+        with mock.patch.dict(os.environ, {sc.CA_CERTS_ENV: "x.cer"}):
+            self.assertEqual(sc.parse_args([]).ca_certs, ["x.cer"])
+        with mock.patch.dict(os.environ, {sc.CA_CERTS_ENV: ""}):
+            self.assertEqual(sc.parse_args([]).ca_certs, [])
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            sc.parse_args(["--ca-cert", "a.cer", "--insecure"])
+
+    def test_end_to_end_against_self_signed_server(self):
+        """Sans le CA : CERTIFICATE_VERIFY_FAILED ; avec --ca-cert (DER) : OK."""
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"result": {"rows": []}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(self.pem, self.key)
+        server.socket = srv_ctx.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"https://localhost:{server.server_address[1]}"
+        try:
+            with self.assertRaises(sc.OrchestratorApiError) as cm:
+                sc.OrchestratorClient("tok", base).get_subscriptions()
+            self.assertIn("CERTIFICATE_VERIFY_FAILED", str(cm.exception))
+            body = sc.OrchestratorClient("tok", base, ca_certs=[self.der]).get_subscriptions()
+            self.assertEqual(body, {"result": {"rows": []}})
+            body = sc.OrchestratorClient("tok", base, insecure=True).get_subscriptions()
+            self.assertEqual(body, {"result": {"rows": []}})
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,12 @@ Usage:
     python subscriptions_cleanup.py --product cos.bucket --base-url https://...
     python subscriptions_cleanup.py --input scratch.json  # lit un JSON local au lieu du GET
 
+TLS (certificat interne BNPP, sinon "CERTIFICATE_VERIFY_FAILED: self-signed
+certificate in certificate chain") :
+    python subscriptions_cleanup.py --ca-cert ~/Root-Certificats-Internes/*.cer
+    export ORCHESTRATOR_CA_CERTS=~/Root-Certificats-Internes/2014-2044\ BNPP\ Root.cer
+    python subscriptions_cleanup.py --insecure   # dernier recours : pas de vérification
+
 Codes de sortie: 0 OK, 1 erreur args/token, 2 erreur HTTP sur le GET,
 3 au moins un DELETE en échec.
 """
@@ -53,6 +59,7 @@ DEFAULT_PRODUCT = "cos.bucket"
 DEFAULT_PRODUCT_BRANCH = "main"
 DEFAULT_USER = "h90871"
 DEFAULT_TIMEOUT = 60
+CA_CERTS_ENV = "ORCHESTRATOR_CA_CERTS"  # chemins séparés par os.pathsep (":" sur macOS/Linux)
 
 ALLOWED_ACTIONS = frozenset({"force_clean", "create", "update"})
 DELETE_ACTION = "delete"
@@ -176,6 +183,50 @@ def find_eligible_subscriptions(
 # Client HTTP
 # --------------------------------------------------------------------------- #
 
+def _load_ca_cert(context: ssl.SSLContext, path: str) -> None:
+    """Ajoute un certificat CA (fichier .cer/.crt/.pem, encodé PEM ou DER) au contexte."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if not data.strip():
+        raise ValueError(f"certificat vide: {path}")
+    try:
+        if b"-----BEGIN" in data:
+            context.load_verify_locations(cadata=data.decode("ascii"))
+        else:
+            context.load_verify_locations(cadata=data)
+    except (ssl.SSLError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"certificat illisible: {path} ({exc})") from exc
+
+
+def build_ssl_context(ca_certs: Iterable[str] | None = None, insecure: bool = False) -> ssl.SSLContext | None:
+    """Contexte TLS pour urlopen.
+
+    - insecure : aucune vérification (check_hostname=False, CERT_NONE) ;
+    - ca_certs : CA système + chaque fichier (PEM ou DER), typiquement les
+      "Root-Certificats-Internes" BNPP ;
+    - sinon None : comportement par défaut de urllib (CA système / $SSL_CERT_FILE).
+    """
+    if insecure:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    paths = [os.path.expanduser(p) for p in (ca_certs or []) if p]
+    if not paths:
+        return None
+    context = ssl.create_default_context()
+    for path in paths:
+        _load_ca_cert(context, path)
+    return context
+
+
+def ca_certs_from_env(value: str | None) -> list[str]:
+    """Découpe $ORCHESTRATOR_CA_CERTS (séparateur os.pathsep) en liste de chemins."""
+    if not value:
+        return []
+    return [p.strip() for p in value.split(os.pathsep) if p.strip()]
+
+
 class OrchestratorClient:
     def __init__(
         self,
@@ -183,17 +234,14 @@ class OrchestratorClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: int = DEFAULT_TIMEOUT,
         insecure: bool = False,
+        ca_certs: Iterable[str] | None = None,
     ):
         if not token:
             raise ValueError("Bearer token manquant")
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._ssl_context: ssl.SSLContext | None = None
-        if insecure:
-            self._ssl_context = ssl.create_default_context()
-            self._ssl_context.check_hostname = False
-            self._ssl_context.verify_mode = ssl.CERT_NONE
+        self._ssl_context = build_ssl_context(ca_certs, insecure)
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         url = f"{self.base_url}{path}"
@@ -286,8 +334,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--delete", action="store_true",
                         help="exécuter réellement les DELETE (sinon: liste seulement)")
     parser.add_argument("--yes", action="store_true", help="ne pas demander de confirmation")
-    parser.add_argument("--insecure", action="store_true",
-                        help="désactive la vérification TLS (CA interne absent)")
+    tls = parser.add_mutually_exclusive_group()
+    tls.add_argument("--ca-cert", nargs="+", metavar="FILE", dest="ca_certs",
+                     default=ca_certs_from_env(os.environ.get(CA_CERTS_ENV)),
+                     help="certificat(s) CA interne(s) à ajouter aux CA système, .cer/.pem en PEM ou DER "
+                          f"(défaut: ${CA_CERTS_ENV}, chemins séparés par '{os.pathsep}')")
+    tls.add_argument("--insecure", action="store_true",
+                     help="désactive la vérification TLS (dernier recours)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="sortie JSON (liste des subscription_id éligibles)")
@@ -305,11 +358,18 @@ def main(argv: list[str] | None = None) -> int:
         if not args.token:
             print("Token manquant: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
             return 1
-        client = OrchestratorClient(args.token, args.base_url, args.timeout, args.insecure)
+        try:
+            client = _make_client(args)
+        except (OSError, ValueError) as exc:
+            print(f"Certificat CA invalide: {exc}", file=sys.stderr)
+            return 1
         try:
             body = client.get_subscriptions(args.product)
         except OrchestratorApiError as exc:
             print(f"GET échoué: {exc}", file=sys.stderr)
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                print(f"Astuce: passer le CA interne avec --ca-cert <fichier.cer> (ou ${CA_CERTS_ENV}).",
+                      file=sys.stderr)
             return 2
 
     user_filter = None if args.all_users else args.user
@@ -339,7 +399,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.token:
             print("Token manquant pour les DELETE/retry: --token ou $ORCHESTRATOR_TOKEN", file=sys.stderr)
             return 1
-        client = OrchestratorClient(args.token, args.base_url, args.timeout, args.insecure)
+        try:
+            client = _make_client(args)
+        except (OSError, ValueError) as exc:
+            print(f"Certificat CA invalide: {exc}", file=sys.stderr)
+            return 1
 
     if not args.yes:
         answer = input(f"\nExécuter {len(to_delete)} DELETE et {len(to_retry)} retry ? [y/N] ").strip().lower()
@@ -371,6 +435,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{len(eligible) - failures} traitée(s), {failures} en échec.")
     return 3 if failures else 0
+
+
+def _make_client(args: argparse.Namespace) -> OrchestratorClient:
+    return OrchestratorClient(args.token, args.base_url, args.timeout,
+                              insecure=args.insecure, ca_certs=args.ca_certs)
 
 
 def _summ(response: Any) -> str:
